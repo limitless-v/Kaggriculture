@@ -1,28 +1,33 @@
 """
 Kaggriculture agent — generalized multi-crop task-queue / scheduler agent
-with drip-sell market ordering.
+with drip-sell market ordering and a daily strategist for hiring / land.
 
 Architecture (see AGENTS.md / README.md for full game rules):
 
-  1. State parsing     - read obs into plain locals, no strategist/expansion yet
-  2. Task queue build   - scan every unlocked tile, emit a prioritized task per tile
-  3. Unit scheduling    - greedily assign each idle unit (farmer + hands) to its
-                          nearest highest-priority reachable task
-  4. Action execution   - move one step toward the assigned tile, or act if there
-  5. Market orders       - DRIP-sell shed contents (capped per item per turn,
-                          with a rolling per-item daily ceiling), keep seed
-                          stock topped up
+  1. State parsing      - read obs into plain locals
+  2. Daily strategist    - runs off obs["hires_today"] / unlocked_quadrants
+                           every turn (cheap enough not to gate on hour==0):
+                           decide how many hands to hire today and whether
+                           to buy the next land quadrant
+  3. Task queue build    - scan every unlocked tile, emit a prioritized task
+                           per tile; plot cap now scales with unit count
+  4. Unit scheduling     - greedily assign each idle unit (farmer + hands)
+                           to its nearest highest-priority reachable task
+  5. Action execution    - move one step toward the assigned tile, or act
+                           if already there
+  6. Market orders       - land purchase attempt, hire attempts, drip-sell
+                           shed contents, keep seed stock topped up
 
 Build order (from the architecture writeup):
-  [DONE] 1. generalized crop loop, no strategist, fixed rotation, 8-plot cap
-  [THIS STEP] 2. market order builder with drip-selling
-  [NEXT]      3. daily strategist for land/hiring
-  [LATER]     4. fertilizer timing, learned/tuned heuristics
+  [DONE] 1. generalized crop loop, no strategist, fixed rotation, plot cap
+  [DONE] 2. market order builder with drip-selling
+  [THIS STEP] 3. daily strategist for hiring + land expansion
+  [NEXT]      4. fertilizer timing, animals, smarter market reads
 
 Deliberately still NOT included:
-  - land purchases (BUY_LAND), hiring (HIRE) -- code supports hands if
-    present, just doesn't hire any yet
   - animals / coops / pastures / fertilizer
+  - crop-mix rebalancing based on live market prices (rotation is still
+    fixed -- the strategist only decides hiring/land, not what to plant)
 """
 
 # ---------------------------------------------------------------------------
@@ -55,10 +60,11 @@ PRIORITY_PLANT = 20
 
 # A lone farmer cannot keep 25 tiles watered inside a 24-turn day (that's
 # ~50 turns of move+water alone) -- tiles left unwatered two days running
-# turn to weeds, which is worse than not planting them at all. Cap how many
-# tiles are actively farmed at once so daily maintenance fits the turn
-# budget; raise this once hands are hired in a future strategist version.
-MAX_ACTIVE_PLOTS = 8
+# turn to weeds, which is worse than not planting them at all. 8 tiles/day
+# is what one unit can reliably water+harvest -- this now scales with the
+# number of units actually on the farm (see PLOTS_PER_UNIT below) instead
+# of being a fixed constant, so hiring hands raises the ceiling automatically.
+PLOTS_PER_UNIT = 8
 
 # Decay for one-time crops begins exactly at max_lifespan_step, but yield
 # actually stops growing a full day earlier (at max_yield_day) -- so there's
@@ -84,16 +90,16 @@ def _manhattan(a, b):
     return abs(a[0] - b[0]) + abs(a[1] - b[1])
 
 
-def _build_tasks(obs, me):
+def _build_tasks(obs, me, plot_cap):
     """Scan the farm and return a priority-sorted list of tile tasks."""
-    step = obs.get("step", obs["day"] * 24 + obs["hour"])
+    step = obs.get("step", obs["day"] * TURNS_PER_DAY + obs["hour"])
     tiles = me["tiles"]
     board_size = len(tiles)
     half = board_size // 2
     unlocked = set(me["unlocked_quadrants"])
 
     # Count tiles already under cultivation so we don't take on more land
-    # than one farmer can water/harvest in a day (see MAX_ACTIVE_PLOTS).
+    # than the current unit count can water/harvest in a day.
     active_plots = sum(
         1
         for y in range(board_size)
@@ -110,7 +116,7 @@ def _build_tasks(obs, me):
             tile = row[x]
 
             if tile is None:
-                if active_plots >= MAX_ACTIVE_PLOTS:
+                if active_plots >= plot_cap:
                     continue
                 crop = CROP_ROTATION[(x * board_size + y) % len(CROP_ROTATION)]
                 tasks.append({
@@ -202,26 +208,78 @@ def _build_unit_actions(units, assignment):
 
 
 # ---------------------------------------------------------------------------
-# Market order builder — Step 2: drip-selling
+# Daily strategist — Step 3: hiring + land expansion
 # ---------------------------------------------------------------------------
-# Goods with steep "sq" / "sqrt"-style downside curves (see README Price
-# Function table) crash hard on oversupply -- strawberry/melon/milk/wool hit
-# the $1 floor at just I0 + a handful of units sold. Dumping a full shed of
-# these in one SELL order is the single easiest way to torch your own
-# margin. Staples (wheat/carrot/tomato/eggs) absorb oversupply more gently
-# and can be sold in bigger chunks without much price damage.
-PREMIUM_GOODS = {"STRAWBERRY", "MELON", "MILK", "WOOL"}
+# Both decisions are cheap to recompute every turn (no state machine needed):
+# hiring reads straight off obs["hires_today"] (resets to 0 each day per the
+# rules), and land purchase reads straight off unlocked_quadrants. Re-running
+# the same check every turn just means "keep trying until it succeeds or the
+# budget runs out for today" -- simpler than gating on hour == 0 and it
+# self-corrects if an order silently no-ops for any reason.
 
+FARM_HAND_COST_MULT = 1  # matches configuration default; adjust if the env config differs
+
+# Fib cost climbs 1,1,2,3,5,8,13,21,... -- stop hiring once the *next* hire
+# would cost more than this. 13 lets us take up to 7 hands/day (cumulative
+# cost 1+1+2+3+5+8+13=33) before the 8th hire (21) prices itself out.
+HIRE_COST_CEILING = 13
+MAX_HIRES_PER_DAY = 7
+
+# Cash we refuse to dip below when hiring or buying land -- keeps seed
+# top-ups and drip-selling reserves from starving out entirely on a
+# hire/land spree.
+CASH_RESERVE = 200
+
+LAND_ORDER = ["NE", "SW", "SE"]
+LAND_COST = {"NE": 1000, "SW": 2000, "SE": 4000}
+# Extra buffer on top of CASH_RESERVE specifically for land, since it's a
+# big one-time spend -- don't buy a quadrant if it would leave us unable to
+# hire or restock seeds for the rest of the day.
+LAND_BUFFER = 500
+
+
+def _fib(n):
+    """0-indexed: fib(0)=1, fib(1)=1, fib(2)=2, fib(3)=3, fib(4)=5, ..."""
+    a, b = 1, 1
+    for _ in range(n):
+        a, b = b, a + b
+    return a
+
+
+def _plan_hires(money, hires_today):
+    """Return how many additional HIRE orders to attempt this turn."""
+    n = hires_today
+    budget = money - CASH_RESERVE
+    planned = 0
+    while planned < MAX_HIRES_PER_DAY:
+        cost = FARM_HAND_COST_MULT * _fib(n)
+        if cost > HIRE_COST_CEILING or cost > budget:
+            break
+        budget -= cost
+        n += 1
+        planned += 1
+    return planned
+
+
+def _plan_land_purchase(unlocked, money):
+    """Return the next quadrant to buy this turn, or None."""
+    for quadrant in LAND_ORDER:
+        if quadrant in unlocked:
+            continue
+        cost = LAND_COST[quadrant]
+        if money - cost >= CASH_RESERVE + LAND_BUFFER:
+            return quadrant
+        return None  # next-in-order quadrant unaffordable -> nothing to buy yet
+    return None  # fully expanded
+
+
+# ---------------------------------------------------------------------------
+# Market order builder — Step 2: drip-selling (unchanged from last pass)
+# ---------------------------------------------------------------------------
+PREMIUM_GOODS = {"STRAWBERRY", "MELON", "MILK", "WOOL"}
 DRIP_CAP_PREMIUM = 2   # max units/turn for strawberry/melon/milk/wool
 DRIP_CAP_STAPLE = 8    # max units/turn for wheat/carrot/tomato/eggs/fertilizer
 
-# We only see *our own* sell orders here (opponent's are private to their
-# agent), but that's exactly the leverage this fixes: a single turn's price
-# doesn't tell you whether you already leaned on this item hard three turns
-# ago. Track our own recent volume per item so repeated small drips don't
-# silently add up to a shed-dump spread across a few turns.
-# Module-level so it persists across agent() calls within one episode (the
-# process isn't restarted between turns).
 _sell_history = {}
 SELL_HISTORY_WINDOW = TURNS_PER_DAY  # look back one in-game day
 
@@ -236,15 +294,34 @@ def _record_sale(item, qty, step):
     _sell_history.setdefault(item, []).append((step, qty))
 
 
-def _build_market_orders(me, private, market, step):
+def _build_market_orders(obs, me, private, market, step):
     shed = private.get("shed", {})
     seeds = private.get("seeds", {})
     money = me["money"]
     prices = market.get("prices", {})
+    unlocked = set(me["unlocked_quadrants"])
+    hires_today = me.get("hires_today", 0)
 
     orders = []
 
-    # --- Drip-sell shed contents ------------------------------------------
+    # --- Land purchase (big one-time spend, try first while cash is high) --
+    quadrant = _plan_land_purchase(unlocked, money)
+    if quadrant is not None:
+        orders.append(["BUY_LAND"])
+        money -= LAND_COST[quadrant]
+
+    # --- Hire hands for today -----------------------------------------------
+    # Re-derive the plan against money *after* any land purchase above, so we
+    # don't double-spend the same cash on both in one turn.
+    n_hires = _plan_hires(money, hires_today)
+    for _ in range(n_hires):
+        if len(orders) >= 10:
+            break
+        orders.append(["HIRE"])
+        money -= FARM_HAND_COST_MULT * _fib(hires_today)
+        hires_today += 1
+
+    # --- Drip-sell shed contents ---------------------------------------------
     # Sell highest-price-per-unit items first: with only maxMarketOrdersPerTurn
     # (10) slots per turn, we don't want a big pile of cheap wheat crowding
     # out a strawberry/melon sale that's actually worth more per order.
@@ -256,11 +333,7 @@ def _build_market_orders(me, private, market, step):
             break
 
         per_turn_cap = DRIP_CAP_PREMIUM if item in PREMIUM_GOODS else DRIP_CAP_STAPLE
-
-        # Soft rolling-day ceiling on top of the per-turn cap: even spread
-        # across many turns, pushing more than ~4x the per-turn cap into the
-        # market inside one day is still enough to crash a premium good.
-        daily_ceiling = per_turn_cap * 4
+        daily_ceiling = per_turn_cap * 4  # soft rolling-day ceiling, see _recent_sold
         room = max(0, daily_ceiling - _recent_sold(item, step))
 
         qty = min(count, per_turn_cap, room)
@@ -270,14 +343,14 @@ def _build_market_orders(me, private, market, step):
         orders.append(["SELL", item, qty])
         _record_sale(item, qty, step)
 
-    # --- Keep seed stock topped up -----------------------------------------
+    # --- Keep seed stock topped up -------------------------------------------
     for crop in CROP_CONFIG:
         if len(orders) >= 10:
             break
         cost = CROP_CONFIG[crop]["seed_cost"]
         have = seeds.get(crop, 0)
-        if have < 3 and money >= cost:
-            buy_n = min(5, int(money // cost))
+        if have < 3 and money >= cost + CASH_RESERVE:
+            buy_n = min(5, int((money - CASH_RESERVE) // cost))
             if buy_n > 0:
                 orders.append(["BUY_SEED", crop, buy_n])
                 money -= buy_n * cost
@@ -296,14 +369,16 @@ def agent(obs):
     for i, hpos in enumerate(me.get("hands", [])):
         units.append((f"hand{i}", tuple(hpos)))
 
-    tasks = _build_tasks(obs, me)
+    plot_cap = PLOTS_PER_UNIT * len(units)
+
+    tasks = _build_tasks(obs, me, plot_cap)
     assignment = _assign_tasks(units, tasks)
     unit_actions = _build_unit_actions(units, assignment)
 
     farmer_action = unit_actions.get("farmer", ["PASS"])
     hand_actions = [unit_actions[f"hand{i}"] for i in range(len(me.get("hands", [])))]
 
-    market_orders = _build_market_orders(me, private, market, step)
+    market_orders = _build_market_orders(obs, me, private, market, step)
 
     return {"farmer": farmer_action, "hands": hand_actions, "market": market_orders}
 
