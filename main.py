@@ -1,22 +1,28 @@
 """
-Kaggriculture agent — generalized multi-crop task-queue / scheduler agent.
+Kaggriculture agent — generalized multi-crop task-queue / scheduler agent
+with drip-sell market ordering.
 
 Architecture (see AGENTS.md / README.md for full game rules):
 
-  1. State parsing    - read obs into plain locals, no strategist/expansion logic yet
-  2. Task queue build  - scan every unlocked tile, emit a prioritized task per tile
-  3. Unit scheduling   - greedily assign each idle unit (farmer + any hands) to its
-                         nearest highest-priority reachable task
-  4. Action execution  - move one step toward the assigned tile, or act if already there
-  5. Market orders     - sell everything sitting in the shed, keep seed stock topped up
+  1. State parsing     - read obs into plain locals, no strategist/expansion yet
+  2. Task queue build   - scan every unlocked tile, emit a prioritized task per tile
+  3. Unit scheduling    - greedily assign each idle unit (farmer + hands) to its
+                          nearest highest-priority reachable task
+  4. Action execution   - move one step toward the assigned tile, or act if there
+  5. Market orders       - DRIP-sell shed contents (capped per item per turn,
+                          with a rolling per-item daily ceiling), keep seed
+                          stock topped up
 
-Deliberately NOT included in this version (fixed crop mix, no expansion):
-  - land purchases (BUY_LAND)
-  - hiring farm hands (HIRE)       -- code supports hands if present, just doesn't hire any
-  - animals / coops / pastures
-  - fertilizer
+Build order (from the architecture writeup):
+  [DONE] 1. generalized crop loop, no strategist, fixed rotation, 8-plot cap
+  [THIS STEP] 2. market order builder with drip-selling
+  [NEXT]      3. daily strategist for land/hiring
+  [LATER]     4. fertilizer timing, learned/tuned heuristics
 
-All of those are natural next steps once this loop is beating the baselines.
+Deliberately still NOT included:
+  - land purchases (BUY_LAND), hiring (HIRE) -- code supports hands if
+    present, just doesn't hire any yet
+  - animals / coops / pastures / fertilizer
 """
 
 # ---------------------------------------------------------------------------
@@ -195,20 +201,76 @@ def _build_unit_actions(units, assignment):
     return actions
 
 
-def _build_market_orders(me, private):
+# ---------------------------------------------------------------------------
+# Market order builder — Step 2: drip-selling
+# ---------------------------------------------------------------------------
+# Goods with steep "sq" / "sqrt"-style downside curves (see README Price
+# Function table) crash hard on oversupply -- strawberry/melon/milk/wool hit
+# the $1 floor at just I0 + a handful of units sold. Dumping a full shed of
+# these in one SELL order is the single easiest way to torch your own
+# margin. Staples (wheat/carrot/tomato/eggs) absorb oversupply more gently
+# and can be sold in bigger chunks without much price damage.
+PREMIUM_GOODS = {"STRAWBERRY", "MELON", "MILK", "WOOL"}
+
+DRIP_CAP_PREMIUM = 2   # max units/turn for strawberry/melon/milk/wool
+DRIP_CAP_STAPLE = 8    # max units/turn for wheat/carrot/tomato/eggs/fertilizer
+
+# We only see *our own* sell orders here (opponent's are private to their
+# agent), but that's exactly the leverage this fixes: a single turn's price
+# doesn't tell you whether you already leaned on this item hard three turns
+# ago. Track our own recent volume per item so repeated small drips don't
+# silently add up to a shed-dump spread across a few turns.
+# Module-level so it persists across agent() calls within one episode (the
+# process isn't restarted between turns).
+_sell_history = {}
+SELL_HISTORY_WINDOW = TURNS_PER_DAY  # look back one in-game day
+
+
+def _recent_sold(item, step):
+    hist = [(s, q) for s, q in _sell_history.get(item, []) if step - s <= SELL_HISTORY_WINDOW]
+    _sell_history[item] = hist
+    return sum(q for _, q in hist)
+
+
+def _record_sale(item, qty, step):
+    _sell_history.setdefault(item, []).append((step, qty))
+
+
+def _build_market_orders(me, private, market, step):
     shed = private.get("shed", {})
     seeds = private.get("seeds", {})
     money = me["money"]
+    prices = market.get("prices", {})
 
     orders = []
 
-    # Sell everything harvested so far -- turns idle inventory into cash the
-    # daily strategist (future work) can act on, and keeps the shed under cap.
-    for item, count in shed.items():
-        if count > 0:
-            orders.append(["SELL", item, count])
+    # --- Drip-sell shed contents ------------------------------------------
+    # Sell highest-price-per-unit items first: with only maxMarketOrdersPerTurn
+    # (10) slots per turn, we don't want a big pile of cheap wheat crowding
+    # out a strawberry/melon sale that's actually worth more per order.
+    sellable = [(item, count) for item, count in shed.items() if count > 0]
+    sellable.sort(key=lambda kv: -prices.get(kv[0], 1))
 
-    # Keep a small seed buffer per crop in the rotation so PLANT never stalls.
+    for item, count in sellable:
+        if len(orders) >= 10:
+            break
+
+        per_turn_cap = DRIP_CAP_PREMIUM if item in PREMIUM_GOODS else DRIP_CAP_STAPLE
+
+        # Soft rolling-day ceiling on top of the per-turn cap: even spread
+        # across many turns, pushing more than ~4x the per-turn cap into the
+        # market inside one day is still enough to crash a premium good.
+        daily_ceiling = per_turn_cap * 4
+        room = max(0, daily_ceiling - _recent_sold(item, step))
+
+        qty = min(count, per_turn_cap, room)
+        if qty <= 0:
+            continue
+
+        orders.append(["SELL", item, qty])
+        _record_sale(item, qty, step)
+
+    # --- Keep seed stock topped up -----------------------------------------
     for crop in CROP_CONFIG:
         if len(orders) >= 10:
             break
@@ -227,6 +289,8 @@ def agent(obs):
     player = obs["player"]
     me = obs["farms"][player]
     private = obs["private"]
+    market = obs["market"]
+    step = obs.get("step", obs["day"] * TURNS_PER_DAY + obs["hour"])
 
     units = [("farmer", tuple(me["farmer"]))]
     for i, hpos in enumerate(me.get("hands", [])):
@@ -239,9 +303,9 @@ def agent(obs):
     farmer_action = unit_actions.get("farmer", ["PASS"])
     hand_actions = [unit_actions[f"hand{i}"] for i in range(len(me.get("hands", [])))]
 
-    market = _build_market_orders(me, private)
+    market_orders = _build_market_orders(me, private, market, step)
 
-    return {"farmer": farmer_action, "hands": hand_actions, "market": market}
+    return {"farmer": farmer_action, "hands": hand_actions, "market": market_orders}
 
 
 if __name__ == "__main__":
