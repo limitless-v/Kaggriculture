@@ -249,7 +249,7 @@ if __name__ == "__main__":
     from kaggle_environments import make
 
     env = make("kaggriculture", configuration={"episodeSteps": 720}, debug=True)
-    env.run([agent, "random"])
+    env.run([agent, "starter"])
     final = env.steps[-1]
     for i, s in enumerate(final):
         print(f"Player {i}: reward={s.reward}, status={s.status}")
