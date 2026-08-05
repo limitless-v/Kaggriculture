@@ -243,7 +243,7 @@ def agent(obs):
 
     return {"farmer": farmer_action, "hands": hand_actions, "market": market}
 
- #test
+
 if __name__ == "__main__":
     # Quick local smoke test: python3 main.py
     from kaggle_environments import make
