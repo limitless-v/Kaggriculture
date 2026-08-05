@@ -1,79 +1,206 @@
 """
-Kaggriculture agent — generalized multi-crop task-queue / scheduler agent
-with drip-sell market ordering and a daily strategist for hiring / land.
+Kaggriculture agent — task-queue / scheduler agent with drip-selling
+(now price-formula-driven), daily strategist (hire/land), animals, and
+fertilizer. All economic constants below are sourced from README.md's
+Object Types and Price Function tables.
 
-Architecture (see AGENTS.md / README.md for full game rules):
+Architecture:
+  1. State parsing       - read obs into plain locals
+  2. Daily strategist     - hiring (Fibonacci cost curve) + land expansion
+  3. Task queue build     - crops, weeds, animal structures/lifecycle,
+                            fertilizer timing (per-crop bonus windows)
+  4. Unit scheduling      - greedy nearest-unit-to-task; tasks needing a
+                            carried item (wheat/fertilizer/animal) redirect
+                            to a shed PICKUP first if nobody's carrying it
+  5. Action execution     - move one step toward the assigned tile/shed
+  6. Market orders        - land, hire, buy animals, price-aware drip-sell,
+                            seed + wheat-feed-buffer top-up
 
-  1. State parsing      - read obs into plain locals
-  2. Daily strategist    - runs off obs["hires_today"] / unlocked_quadrants
-                           every turn (cheap enough not to gate on hour==0):
-                           decide how many hands to hire today and whether
-                           to buy the next land quadrant
-  3. Task queue build    - scan every unlocked tile, emit a prioritized task
-                           per tile; plot cap now scales with unit count
-  4. Unit scheduling     - greedily assign each idle unit (farmer + hands)
-                           to its nearest highest-priority reachable task
-  5. Action execution    - move one step toward the assigned tile, or act
-                           if already there
-  6. Market orders       - land purchase attempt, hire attempts, drip-sell
-                           shed contents, keep seed stock topped up
-
-Build order (from the architecture writeup):
-  [DONE] 1. generalized crop loop, no strategist, fixed rotation, plot cap
-  [DONE] 2. market order builder with drip-selling
-  [THIS STEP] 3. daily strategist for hiring + land expansion
-  [NEXT]      4. fertilizer timing, animals, smarter market reads
-
-Deliberately still NOT included:
-  - animals / coops / pastures / fertilizer
-  - crop-mix rebalancing based on live market prices (rotation is still
-    fixed -- the strategist only decides hiring/land, not what to plant)
+Build order:
+  [DONE] 1. generalized crop loop
+  [DONE] 2. drip-selling market builder
+  [DONE] 3. daily strategist (hire/land)
+  [DONE] 4. animals + fertilizer
+  [THIS STEP] 5. real table values + price-formula-driven selling
+  [NEXT]      6. crop-mix rebalancing against live prices, ROI-aware
+               animal targets (goose/cow/sheep payback differs a lot --
+               see Object Types comments below), opponent-aware town-demand
+               timing
 """
 
-# ---------------------------------------------------------------------------
-# Static knowledge: crop economics (README.md "Object Types" table)
-# ---------------------------------------------------------------------------
+import math
 
+# ---------------------------------------------------------------------------
+# Object Types (README.md table) -- crop economics
+# ---------------------------------------------------------------------------
+# bonus_window = (start_age, end_age) for one-time crops: watering in this
+# window adds +1 yield/day (or +2 if fertilized). Age = day - planted_day.
+# Wheat/Carrot windows follow the general ceil(max_yield_day/2) rule; Melon
+# is an explicit override per the README note ("bonus window is ages 6-12",
+# NOT derivable from its Time-to-Max-Yield of 10).
 CROP_CONFIG = {
-    "WHEAT":      {"seed_cost": 10,  "ongoing": False},
-    "CARROT":     {"seed_cost": 20,  "ongoing": False},
-    "MELON":      {"seed_cost": 80,  "ongoing": False},
-    "TOMATO":     {"seed_cost": 50,  "ongoing": True},
-    "STRAWBERRY": {"seed_cost": 100, "ongoing": True},
+    "WHEAT":      {"seed_cost": 10,  "base_price": 25,  "ongoing": False,
+                    "first_yield_day": 2, "max_yield_day": 4, "bonus_window": (2, 4), "max_yield": 6},
+    "CARROT":     {"seed_cost": 20,  "base_price": 35,  "ongoing": False,
+                    "first_yield_day": 2, "max_yield_day": 3, "bonus_window": (2, 3), "max_yield": 4},
+    "MELON":      {"seed_cost": 80,  "base_price": 250, "ongoing": False,
+                    "first_yield_day": 10, "max_yield_day": 10, "bonus_window": (6, 12), "max_yield": 6},
+    "TOMATO":     {"seed_cost": 50,  "base_price": 60,  "ongoing": True,
+                    "first_yield_day": 8, "max_yield_day": 11, "interval_days": 1, "max_yield": 4},
+    "STRAWBERRY": {"seed_cost": 100, "base_price": 120, "ongoing": True,
+                    "first_yield_day": 10, "max_yield_day": 16, "interval_days": 2, "max_yield": 4},
 }
 
-# Fixed planting rotation for empty tiles -- cheap staples get more tiles than
-# expensive ongoing crops, since ongoing crops occupy a tile far longer per
-# seed dollar spent (see the Yield/tile/day figures in README.md).
 CROP_ROTATION = [
     "WHEAT", "WHEAT", "CARROT", "WHEAT", "CARROT",
     "MELON", "TOMATO", "CARROT", "WHEAT", "STRAWBERRY",
 ]
 
-# Priorities: higher runs first. Weeds and about-to-decay harvests are
-# time-critical; routine watering matters more than expanding into new tiles.
-PRIORITY_URGENT_HARVEST = 95   # plant about to start losing yield to decay
+PRIORITY_URGENT_HARVEST = 95
 PRIORITY_WEED = 60
-PRIORITY_HARVEST_ONGOING = 70  # tomato/strawberry, opportunistic
-PRIORITY_WATER_BASE = 50       # + 20 per consecutive_unwatered day
+PRIORITY_HARVEST_ONGOING = 70
+PRIORITY_ANIMAL_HARVEST = 65
+PRIORITY_FEED = 80
+PRIORITY_WATER_BASE = 50
+PRIORITY_FERTILIZE_ONGOING = 45
+PRIORITY_FERTILIZE_ONETIME = 35
+PRIORITY_CARE = 30
+PRIORITY_BUILD_STRUCTURE = 30
+PRIORITY_PLACE_ANIMAL = 55
 PRIORITY_PLANT = 20
+PRIORITY_COLLECT_FERTILIZER = 15
 
-# A lone farmer cannot keep 25 tiles watered inside a 24-turn day (that's
-# ~50 turns of move+water alone) -- tiles left unwatered two days running
-# turn to weeds, which is worse than not planting them at all. 8 tiles/day
-# is what one unit can reliably water+harvest -- this now scales with the
-# number of units actually on the farm (see PLOTS_PER_UNIT below) instead
-# of being a fixed constant, so hiring hands raises the ceiling automatically.
 PLOTS_PER_UNIT = 8
-
-# Decay for one-time crops begins exactly at max_lifespan_step, but yield
-# actually stops growing a full day earlier (at max_yield_day) -- so there's
-# a whole day where the crop is at peak value and just waiting to be
-# collected. Flag it urgent as soon as that peak day starts, not on the
-# last turn before decay -- one turn is not enough lead time for the
-# farmer to travel to the tile and act.
 TURNS_PER_DAY = 24
 HARVEST_LEAD_TURNS = TURNS_PER_DAY
+
+SHED_TILES = [(4, 4), (5, 4), (4, 5), (5, 5)]
+
+# ---------------------------------------------------------------------------
+# Animals (README.md Object Types table)
+# ---------------------------------------------------------------------------
+# ROI note for the future rebalancing step: at base prices, steady-state
+# revenue/day is price/interval -- Goose $50/1d=$50/day, Cow $160/2d=$80/day,
+# Sheep $200/3d=~$67/day -- but cow/sheep cost 400/500 vs goose's 300 and
+# take longer to reach first yield (8/6 days vs goose's 4), so goose pays
+# back fastest even though its steady-state rate is lower. Worth revisiting
+# once ANIMAL_TARGETS becomes a ranked/ROI-driven choice instead of "one of each".
+ANIMAL_CONFIG = {
+    "GOOSE": {"structure": "COOP",    "product": "EGG",  "cost": 300, "base_price": 50,
+               "first_yield_day": 4, "interval_days": 1, "max_held": 4},
+    "COW":   {"structure": "PASTURE", "product": "MILK", "cost": 400, "base_price": 160,
+               "first_yield_day": 8, "interval_days": 2, "max_held": 6},
+    "SHEEP": {"structure": "PASTURE", "product": "WOOL", "cost": 500, "base_price": 200,
+               "first_yield_day": 6, "interval_days": 3, "max_held": 6},
+}
+ANIMAL_TARGETS = {"GOOSE": 1, "COW": 1, "SHEEP": 1}
+STRUCTURE_TARGETS = {"COOP": 1, "PASTURE": 2}
+
+WHEAT_FEED_BUFFER = 10
+FERTILIZER_FETCH_QTY = 1
+
+# ---------------------------------------------------------------------------
+# Price Function (README.md Market Mechanics table)
+# ---------------------------------------------------------------------------
+# price(inv) = base + sign * amp * f(|inv - I0|)
+#   sign = +1 if inv < I0 (scarcity), -1 if inv > I0 (glut)
+#   amp  = target * base / f(T)
+# Floored at $1, rounded to nearest dollar. Exact replica of the game's
+# formula -- lets us predict price impact *before* selling instead of
+# guessing at a flat per-item cap.
+MARKET_PARAMS = {
+    "WHEAT":      {"base": 25,  "I0": 10000, "T": 400, "below_func": "sqrt",   "below_target": 0.80,
+                    "above_func": "log",    "above_target": 0.20},
+    "CARROT":     {"base": 35,  "I0": 10000, "T": 450, "below_func": "log",    "below_target": 0.20,
+                    "above_func": "sqrt",   "above_target": 0.70},
+    "TOMATO":     {"base": 60,  "I0": 10000, "T": 200, "below_func": "linear", "below_target": 0.40,
+                    "above_func": "sqrt",   "above_target": 0.60},
+    "STRAWBERRY": {"base": 120, "I0": 10000, "T": 100, "below_func": "sqrt",   "below_target": 0.70,
+                    "above_func": "linear", "above_target": 1.60},
+    "MELON":      {"base": 250, "I0": 10000, "T": 300, "below_func": "log",    "below_target": 0.20,
+                    "above_func": "sq",     "above_target": 3.60},
+    "EGG":        {"base": 50,  "I0": 10000, "T": 332, "below_func": "linear", "below_target": 0.40,
+                    "above_func": "log",    "above_target": 0.20},
+    "MILK":       {"base": 160, "I0": 10000, "T": 122, "below_func": "sqrt",   "below_target": 0.60,
+                    "above_func": "linear", "above_target": 1.60},
+    "WOOL":       {"base": 200, "I0": 10000, "T": 105, "below_func": "log",    "below_target": 0.20,
+                    "above_func": "sq",     "above_target": 3.20},
+    "FERTILIZER": {"base": 100, "I0": 10000, "T": 200, "below_func": "linear", "below_target": 0.40,
+                    "above_func": "linear", "above_target": 0.40},
+}
+
+
+def _shape(name, x):
+    if name == "linear":
+        return x
+    if name == "sq":
+        return x * x
+    if name == "sqrt":
+        return math.sqrt(x)
+    if name == "log":
+        return math.log(1 + x)
+    if name == "log10":
+        return math.log10(1 + x)
+    raise ValueError(f"unknown shape function: {name}")
+
+
+def _price_at(item, inv):
+    """Replicates the game's price(inv) formula exactly."""
+    p = MARKET_PARAMS.get(item)
+    if p is None:
+        return 1
+    base, I0, T = p["base"], p["I0"], p["T"]
+    if inv == I0:
+        return base
+    if inv < I0:
+        func, target, sign, diff = p["below_func"], p["below_target"], 1, I0 - inv
+    else:
+        func, target, sign, diff = p["above_func"], p["above_target"], -1, inv - I0
+    amp = target * base / _shape(func, T)
+    price = base + sign * amp * _shape(func, diff)
+    return max(1, round(price))
+
+
+def _max_sell_qty(item, market_inv, available, max_drop_frac=0.15, hard_cap=25):
+    """
+    How many units of `item` we can sell this turn before the price would
+    drop more than max_drop_frac below its current value (selling adds 1
+    to market inventory per unit, same as the game's one-at-a-time model).
+    Reads live market inventory from obs each turn, so it's inherently
+    self-correcting against the opponent's sells too -- no need to track
+    our own sell history separately.
+    """
+    if item not in MARKET_PARAMS or available <= 0:
+        return 0
+    current_price = _price_at(item, market_inv)
+    floor_price = max(1, current_price * (1 - max_drop_frac))
+    qty = 0
+    sim_inv = market_inv
+    while qty < min(available, hard_cap):
+        sim_inv += 1
+        if _price_at(item, sim_inv) < floor_price:
+            break
+        qty += 1
+    return qty
+
+
+def _max_buy_qty(item, market_inv, money, reserve, max_rise_frac=0.15, hard_cap=25):
+    """Symmetric guard for BUY_PRODUCT: stop buying once price rises too much."""
+    if item not in MARKET_PARAMS:
+        return 0
+    current_price = _price_at(item, market_inv)
+    ceiling_price = current_price * (1 + max_rise_frac)
+    budget = money - reserve
+    qty = 0
+    sim_inv = market_inv
+    while qty < hard_cap:
+        p = _price_at(item, sim_inv - 1) if sim_inv > 0 else current_price
+        if p > ceiling_price or p > budget:
+            break
+        budget -= p
+        sim_inv -= 1
+        qty += 1
+    return qty
 
 
 def _quadrant_of(x, y, half):
@@ -90,22 +217,38 @@ def _manhattan(a, b):
     return abs(a[0] - b[0]) + abs(a[1] - b[1])
 
 
+def _nearest_shed_tile(pos):
+    return min(SHED_TILES, key=lambda t: _manhattan(pos, t))
+
+
+# ---------------------------------------------------------------------------
+# Task queue
+# ---------------------------------------------------------------------------
+
 def _build_tasks(obs, me, plot_cap):
-    """Scan the farm and return a priority-sorted list of tile tasks."""
     step = obs.get("step", obs["day"] * TURNS_PER_DAY + obs["hour"])
+    day = obs["day"]
     tiles = me["tiles"]
     board_size = len(tiles)
     half = board_size // 2
     unlocked = set(me["unlocked_quadrants"])
 
-    # Count tiles already under cultivation so we don't take on more land
-    # than the current unit count can water/harvest in a day.
-    active_plots = sum(
-        1
-        for y in range(board_size)
-        for x in range(board_size)
-        if isinstance(tiles[y][x], dict) and tiles[y][x].get("kind") == "PLANT"
-    )
+    active_plots = 0
+    structure_counts = {"COOP": 0, "PASTURE": 0}
+    animal_counts = {a: 0 for a in ANIMAL_CONFIG}
+
+    for y in range(board_size):
+        for x in range(board_size):
+            t = tiles[y][x]
+            if not isinstance(t, dict):
+                continue
+            if t.get("kind") == "PLANT":
+                active_plots += 1
+            elif t.get("kind") in ("COOP", "PASTURE"):
+                structure_counts[t["kind"]] += 1
+                animal = t.get("animal")
+                if animal in animal_counts:
+                    animal_counts[animal] += 1
 
     tasks = []
     for y in range(board_size):
@@ -114,71 +257,156 @@ def _build_tasks(obs, me, plot_cap):
             if _quadrant_of(x, y, half) not in unlocked:
                 continue
             tile = row[x]
+            pos = (x, y)
 
             if tile is None:
+                needed_structure = None
+                for structure, target in STRUCTURE_TARGETS.items():
+                    if structure_counts[structure] < target:
+                        needed_structure = structure
+                        break
+
+                if needed_structure is not None:
+                    tasks.append({
+                        "pos": pos,
+                        "action": ["BUILD_COOP" if needed_structure == "COOP" else "BUILD_PASTURE"],
+                        "priority": PRIORITY_BUILD_STRUCTURE,
+                    })
+                    structure_counts[needed_structure] += 1
+                    continue
+
                 if active_plots >= plot_cap:
                     continue
                 crop = CROP_ROTATION[(x * board_size + y) % len(CROP_ROTATION)]
-                tasks.append({
-                    "pos": (x, y),
-                    "action": ["PLANT", crop],
-                    "priority": PRIORITY_PLANT,
-                })
-                active_plots += 1  # reserve the slot so we don't over-queue
+                tasks.append({"pos": pos, "action": ["PLANT", crop], "priority": PRIORITY_PLANT})
+                active_plots += 1
                 continue
 
             if not isinstance(tile, dict):
                 continue
-
             kind = tile.get("kind")
 
             if kind == "WEED":
-                tasks.append({"pos": (x, y), "action": ["DIG"], "priority": PRIORITY_WEED})
+                tasks.append({"pos": pos, "action": ["DIG"], "priority": PRIORITY_WEED})
                 continue
 
-            if kind != "PLANT":
-                # COOP / PASTURE -- no animal strategy in this version yet.
+            if kind == "PLANT":
+                crop = tile["crop"]
+                cfg = CROP_CONFIG.get(crop)
+                if cfg is None:
+                    continue
+                yield_units = tile.get("yield_units", 0)
+                watered = tile.get("watered_today", False)
+                lifespan_step = tile.get("max_lifespan_step", -1)
+                decaying_soon = lifespan_step != -1 and step >= lifespan_step - HARVEST_LEAD_TURNS
+                fertilized_until = tile.get("fertilized_until_day", -1)
+                age = day - tile.get("planted_day", day)
+
+                if yield_units > 0 and decaying_soon:
+                    tasks.append({"pos": pos, "action": ["HARVEST"], "priority": PRIORITY_URGENT_HARVEST})
+                elif yield_units > 0 and cfg["ongoing"]:
+                    tasks.append({"pos": pos, "action": ["HARVEST"], "priority": PRIORITY_HARVEST_ONGOING})
+                elif not watered:
+                    cu = tile.get("consecutive_unwatered", 0)
+                    tasks.append({"pos": pos, "action": ["WATER"],
+                                   "priority": PRIORITY_WATER_BASE + cu * 20})
+                elif cfg["ongoing"] and fertilized_until < day:
+                    # Doubling only triggers if fertilize + water land the same
+                    # day -- already watered today, so fertilize now.
+                    tasks.append({"pos": pos, "action": ["FERTILIZE"],
+                                   "priority": PRIORITY_FERTILIZE_ONGOING,
+                                   "requires_carry": "FERTILIZER", "carry_qty": FERTILIZER_FETCH_QTY})
+                elif (not cfg["ongoing"] and fertilized_until < day
+                      and cfg["bonus_window"][0] <= age <= cfg["bonus_window"][1]):
+                    tasks.append({"pos": pos, "action": ["FERTILIZE"],
+                                   "priority": PRIORITY_FERTILIZE_ONETIME,
+                                   "requires_carry": "FERTILIZER", "carry_qty": FERTILIZER_FETCH_QTY})
                 continue
 
-            crop = tile["crop"]
-            cfg = CROP_CONFIG.get(crop, {"ongoing": False})
-            yield_units = tile.get("yield_units", 0)
-            watered = tile.get("watered_today", False)
-            lifespan_step = tile.get("max_lifespan_step", -1)
-            decaying_soon = (
-                lifespan_step != -1 and step >= lifespan_step - HARVEST_LEAD_TURNS
-            )
+            if kind in ("COOP", "PASTURE"):
+                animal = tile.get("animal")
+                if animal is None:
+                    candidates = [a for a, cfg in ANIMAL_CONFIG.items()
+                                  if cfg["structure"] == kind and animal_counts[a] < ANIMAL_TARGETS[a]]
+                    if candidates:
+                        target_animal = candidates[0]
+                        tasks.append({"pos": pos, "action": ["PLACE", target_animal],
+                                       "priority": PRIORITY_PLACE_ANIMAL,
+                                       "requires_carry": target_animal, "carry_qty": 1})
+                    continue
 
-            if yield_units > 0 and decaying_soon:
-                # Salvage yield before it starts eroding -- always take priority.
-                tasks.append({"pos": (x, y), "action": ["HARVEST"],
-                               "priority": PRIORITY_URGENT_HARVEST})
-            elif yield_units > 0 and cfg["ongoing"]:
-                # Ongoing crops (tomato/strawberry): harvest as soon as a
-                # scheduled production lands, no benefit to waiting.
-                tasks.append({"pos": (x, y), "action": ["HARVEST"],
-                               "priority": PRIORITY_HARVEST_ONGOING})
-            elif not watered:
-                cu = tile.get("consecutive_unwatered", 0)
-                tasks.append({"pos": (x, y), "action": ["WATER"],
-                               "priority": PRIORITY_WATER_BASE + cu * 20})
-            # else: one-time crop still growing toward its peak, already
-            # watered today -- nothing useful to do here this turn.
+                yield_units = tile.get("yield_units", 0)
+                fed_today = tile.get("fed_today", False)
+                consecutive_unfed = tile.get("consecutive_unfed", 0)
+                cared_today = tile.get("cared_today", False)
+                fertilizer_available = tile.get("fertilizer_available", False)
+
+                if not fed_today:
+                    tasks.append({"pos": pos, "action": ["FEED"],
+                                   "priority": PRIORITY_FEED + consecutive_unfed * 20,
+                                   "requires_carry": "WHEAT", "carry_qty": 1})
+                elif yield_units > 0:
+                    tasks.append({"pos": pos, "action": ["HARVEST"], "priority": PRIORITY_ANIMAL_HARVEST})
+                elif not cared_today:
+                    tasks.append({"pos": pos, "action": ["CARE"], "priority": PRIORITY_CARE})
+                elif fertilizer_available:
+                    tasks.append({"pos": pos, "action": ["COLLECT_FERTILIZER"],
+                                   "priority": PRIORITY_COLLECT_FERTILIZER})
+                continue
 
     tasks.sort(key=lambda t: -t["priority"])
     return tasks
 
 
-def _assign_tasks(units, tasks):
-    """Greedy nearest-unit-to-highest-priority-task assignment."""
+# ---------------------------------------------------------------------------
+# Unit scheduling -- carry-aware
+# ---------------------------------------------------------------------------
+
+def _carried_count(private, unit_index, item):
+    inventories = private.get("inventories", [])
+    if unit_index >= len(inventories) or not isinstance(inventories[unit_index], dict):
+        return 0
+    return inventories[unit_index].get(item, 0)
+
+
+def _assign_tasks(units, tasks, private, shed):
     remaining = list(units)
+    name_to_index = {name: i for i, (name, _pos) in enumerate(units)}
     assignment = {}
+
     for task in tasks:
         if not remaining:
             break
-        best = min(remaining, key=lambda u: _manhattan(u[1], task["pos"]))
-        assignment[best[0]] = task
+
+        req_item = task.get("requires_carry")
+        if req_item is None:
+            best = min(remaining, key=lambda u: _manhattan(u[1], task["pos"]))
+            assignment[best[0]] = task
+            remaining.remove(best)
+            continue
+
+        req_qty = task.get("carry_qty", 1)
+        carriers = [u for u in remaining
+                    if _carried_count(private, name_to_index[u[0]], req_item) >= req_qty]
+
+        if carriers:
+            best = min(carriers, key=lambda u: _manhattan(u[1], task["pos"]))
+            assignment[best[0]] = task
+            remaining.remove(best)
+            continue
+
+        if shed.get(req_item, 0) < req_qty:
+            continue
+
+        best = min(remaining, key=lambda u: _manhattan(u[1], _nearest_shed_tile(u[1])))
+        fetch_task = {
+            "pos": _nearest_shed_tile(best[1]),
+            "action": ["PICKUP", req_item, req_qty],
+            "priority": task["priority"],
+        }
+        assignment[best[0]] = fetch_task
         remaining.remove(best)
+
     return assignment
 
 
@@ -208,38 +436,19 @@ def _build_unit_actions(units, assignment):
 
 
 # ---------------------------------------------------------------------------
-# Daily strategist — Step 3: hiring + land expansion
+# Daily strategist -- hiring + land
 # ---------------------------------------------------------------------------
-# Both decisions are cheap to recompute every turn (no state machine needed):
-# hiring reads straight off obs["hires_today"] (resets to 0 each day per the
-# rules), and land purchase reads straight off unlocked_quadrants. Re-running
-# the same check every turn just means "keep trying until it succeeds or the
-# budget runs out for today" -- simpler than gating on hour == 0 and it
-# self-corrects if an order silently no-ops for any reason.
-
-FARM_HAND_COST_MULT = 1  # matches configuration default; adjust if the env config differs
-
-# Fib cost climbs 1,1,2,3,5,8,13,21,... -- stop hiring once the *next* hire
-# would cost more than this. 13 lets us take up to 7 hands/day (cumulative
-# cost 1+1+2+3+5+8+13=33) before the 8th hire (21) prices itself out.
+FARM_HAND_COST_MULT = 1
 HIRE_COST_CEILING = 13
 MAX_HIRES_PER_DAY = 7
-
-# Cash we refuse to dip below when hiring or buying land -- keeps seed
-# top-ups and drip-selling reserves from starving out entirely on a
-# hire/land spree.
 CASH_RESERVE = 200
 
 LAND_ORDER = ["NE", "SW", "SE"]
 LAND_COST = {"NE": 1000, "SW": 2000, "SE": 4000}
-# Extra buffer on top of CASH_RESERVE specifically for land, since it's a
-# big one-time spend -- don't buy a quadrant if it would leave us unable to
-# hire or restock seeds for the rest of the day.
 LAND_BUFFER = 500
 
 
 def _fib(n):
-    """0-indexed: fib(0)=1, fib(1)=1, fib(2)=2, fib(3)=3, fib(4)=5, ..."""
     a, b = 1, 1
     for _ in range(n):
         a, b = b, a + b
@@ -247,7 +456,6 @@ def _fib(n):
 
 
 def _plan_hires(money, hires_today):
-    """Return how many additional HIRE orders to attempt this turn."""
     n = hires_today
     budget = money - CASH_RESERVE
     planned = 0
@@ -262,36 +470,33 @@ def _plan_hires(money, hires_today):
 
 
 def _plan_land_purchase(unlocked, money):
-    """Return the next quadrant to buy this turn, or None."""
     for quadrant in LAND_ORDER:
         if quadrant in unlocked:
             continue
         cost = LAND_COST[quadrant]
         if money - cost >= CASH_RESERVE + LAND_BUFFER:
             return quadrant
-        return None  # next-in-order quadrant unaffordable -> nothing to buy yet
-    return None  # fully expanded
+        return None
+    return None
 
 
 # ---------------------------------------------------------------------------
-# Market order builder — Step 2: drip-selling (unchanged from last pass)
+# Market order builder
 # ---------------------------------------------------------------------------
-PREMIUM_GOODS = {"STRAWBERRY", "MELON", "MILK", "WOOL"}
-DRIP_CAP_PREMIUM = 2   # max units/turn for strawberry/melon/milk/wool
-DRIP_CAP_STAPLE = 8    # max units/turn for wheat/carrot/tomato/eggs/fertilizer
-
-_sell_history = {}
-SELL_HISTORY_WINDOW = TURNS_PER_DAY  # look back one in-game day
+MAX_PRICE_DROP_FRAC = 0.15  # don't let our own selling crater price >15% in one turn
+MAX_PRICE_RISE_FRAC = 0.15  # symmetric guard for buying
 
 
-def _recent_sold(item, step):
-    hist = [(s, q) for s, q in _sell_history.get(item, []) if step - s <= SELL_HISTORY_WINDOW]
-    _sell_history[item] = hist
-    return sum(q for _, q in hist)
-
-
-def _record_sale(item, qty, step):
-    _sell_history.setdefault(item, []).append((step, qty))
+def _animal_shortfall(me):
+    board = me["tiles"]
+    placed = {a: 0 for a in ANIMAL_CONFIG}
+    for row in board:
+        for t in row:
+            if isinstance(t, dict) and t.get("kind") in ("COOP", "PASTURE"):
+                a = t.get("animal")
+                if a in placed:
+                    placed[a] += 1
+    return placed
 
 
 def _build_market_orders(obs, me, private, market, step):
@@ -299,20 +504,19 @@ def _build_market_orders(obs, me, private, market, step):
     seeds = private.get("seeds", {})
     money = me["money"]
     prices = market.get("prices", {})
+    inventory = market.get("inventory", {})
     unlocked = set(me["unlocked_quadrants"])
     hires_today = me.get("hires_today", 0)
 
     orders = []
 
-    # --- Land purchase (big one-time spend, try first while cash is high) --
+    # --- Land purchase --------------------------------------------------
     quadrant = _plan_land_purchase(unlocked, money)
     if quadrant is not None:
         orders.append(["BUY_LAND"])
         money -= LAND_COST[quadrant]
 
-    # --- Hire hands for today -----------------------------------------------
-    # Re-derive the plan against money *after* any land purchase above, so we
-    # don't double-spend the same cash on both in one turn.
+    # --- Hire hands -------------------------------------------------------
     n_hires = _plan_hires(money, hires_today)
     for _ in range(n_hires):
         if len(orders) >= 10:
@@ -321,27 +525,34 @@ def _build_market_orders(obs, me, private, market, step):
         money -= FARM_HAND_COST_MULT * _fib(hires_today)
         hires_today += 1
 
-    # --- Drip-sell shed contents ---------------------------------------------
-    # Sell highest-price-per-unit items first: with only maxMarketOrdersPerTurn
-    # (10) slots per turn, we don't want a big pile of cheap wheat crowding
-    # out a strawberry/melon sale that's actually worth more per order.
-    sellable = [(item, count) for item, count in shed.items() if count > 0]
+    # --- Buy animals still short of target ---------------------------------
+    placed = _animal_shortfall(me)
+    for animal, target in ANIMAL_TARGETS.items():
+        if len(orders) >= 10:
+            break
+        already_owned = placed.get(animal, 0) + shed.get(animal, 0)
+        cost = ANIMAL_CONFIG[animal]["cost"]
+        if already_owned < target and money - CASH_RESERVE >= cost:
+            orders.append(["BUY_ANIMAL", animal, 1])
+            money -= cost
+
+    # --- Price-aware drip-sell of shed contents -----------------------------
+    sellable = [(item, count) for item, count in shed.items()
+                if count > 0 and item not in ANIMAL_TARGETS]
     sellable.sort(key=lambda kv: -prices.get(kv[0], 1))
 
     for item, count in sellable:
         if len(orders) >= 10:
             break
+        available = count
+        if item == "WHEAT":
+            available = max(0, count - WHEAT_FEED_BUFFER)  # protect animal feed stock
 
-        per_turn_cap = DRIP_CAP_PREMIUM if item in PREMIUM_GOODS else DRIP_CAP_STAPLE
-        daily_ceiling = per_turn_cap * 4  # soft rolling-day ceiling, see _recent_sold
-        room = max(0, daily_ceiling - _recent_sold(item, step))
-
-        qty = min(count, per_turn_cap, room)
+        market_inv = inventory.get(item, MARKET_PARAMS.get(item, {}).get("I0", 10000))
+        qty = _max_sell_qty(item, market_inv, available, max_drop_frac=MAX_PRICE_DROP_FRAC)
         if qty <= 0:
             continue
-
         orders.append(["SELL", item, qty])
-        _record_sale(item, qty, step)
 
     # --- Keep seed stock topped up -------------------------------------------
     for crop in CROP_CONFIG:
@@ -354,6 +565,15 @@ def _build_market_orders(obs, me, private, market, step):
             if buy_n > 0:
                 orders.append(["BUY_SEED", crop, buy_n])
                 money -= buy_n * cost
+
+    # --- Keep wheat feed buffer topped up via BUY_PRODUCT --------------------
+    if len(orders) < 10 and shed.get("WHEAT", 0) < WHEAT_FEED_BUFFER:
+        need = WHEAT_FEED_BUFFER - shed.get("WHEAT", 0)
+        market_inv = inventory.get("WHEAT", MARKET_PARAMS["WHEAT"]["I0"])
+        buy_n = min(need, _max_buy_qty("WHEAT", market_inv, money, CASH_RESERVE,
+                                         max_rise_frac=MAX_PRICE_RISE_FRAC))
+        if buy_n > 0:
+            orders.append(["BUY_PRODUCT", "WHEAT", buy_n])
 
     return orders[:10]
 
@@ -372,7 +592,7 @@ def agent(obs):
     plot_cap = PLOTS_PER_UNIT * len(units)
 
     tasks = _build_tasks(obs, me, plot_cap)
-    assignment = _assign_tasks(units, tasks)
+    assignment = _assign_tasks(units, tasks, private, private.get("shed", {}))
     unit_actions = _build_unit_actions(units, assignment)
 
     farmer_action = unit_actions.get("farmer", ["PASS"])
@@ -384,7 +604,6 @@ def agent(obs):
 
 
 if __name__ == "__main__":
-    # Quick local smoke test: python3 main.py
     from kaggle_environments import make
 
     env = make("kaggriculture", configuration={"episodeSteps": 720}, debug=True)
