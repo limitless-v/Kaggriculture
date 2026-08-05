@@ -604,10 +604,54 @@ def agent(obs):
 
 
 if __name__ == "__main__":
+    import json
     from kaggle_environments import make
 
-    env = make("kaggriculture", configuration={"episodeSteps": 720}, debug=True)
-    env.run([agent, "starter"])
-    final = env.steps[-1]
-    for i, s in enumerate(final):
-        print(f"Player {i}: reward={s.reward}, status={s.status}")
+    NUM_PLAYS = 100
+    TURNS_PER_PLAY = 720
+    OUTPUT_FILE = "results.json"
+
+    # rewards[player_index] = list of per-play rewards
+    rewards = {0: [], 1: []}
+    plays_log = []  # one dict per play
+
+    print(f"Running {NUM_PLAYS} plays ({TURNS_PER_PLAY} turns each)...\n")
+    print(f"{'Play':>5}  {'P0 Reward':>12}  {'P1 Reward':>12}")
+    print("-" * 35)
+
+    for play in range(1, NUM_PLAYS + 1):
+        env = make("kaggriculture", configuration={"episodeSteps": TURNS_PER_PLAY}, debug=False)
+        env.run([agent, "starter"])
+        final = env.steps[-1]
+
+        r0 = final[0].reward if final[0].reward is not None else 0.0
+        r1 = final[1].reward if final[1].reward is not None else 0.0
+
+        rewards[0].append(r0)
+        rewards[1].append(r1)
+        plays_log.append({"play": play, "turns": TURNS_PER_PLAY,
+                          "player_0": r0, "player_1": r1})
+
+        print(f"{play:>5}  {r0:>12.1f}  {r1:>12.1f}")
+
+    # ── Summary ──────────────────────────────────────────────────────────────
+    summary = {}
+    print("\n" + "=" * 55)
+    print(f"{'Summary after':} {NUM_PLAYS} plays  ({TURNS_PER_PLAY} turns/play)")
+    print("=" * 55)
+    for pid in (0, 1):
+        r = rewards[pid]
+        avg = sum(r) / len(r)
+        summary[f"player_{pid}"] = {"avg": round(avg, 2), "min": min(r), "max": max(r)}
+        print(f"  Player {pid}:  avg={avg:>10.1f}  min={min(r):>10.1f}  max={max(r):>10.1f}")
+    print("=" * 55)
+
+    # ── Write JSON ────────────────────────────────────────────────────────────
+    output = {
+        "config": {"num_plays": NUM_PLAYS, "turns_per_play": TURNS_PER_PLAY},
+        "plays": plays_log,
+        "summary": summary,
+    }
+    with open(OUTPUT_FILE, "w") as f:
+        json.dump(output, f, indent=2)
+    print(f"\nResults saved to {OUTPUT_FILE}")

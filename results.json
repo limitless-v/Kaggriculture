@@ -1,0 +1,620 @@
+{
+  "config": {
+    "num_plays": 100,
+    "turns_per_play": 720
+  },
+  "plays": [
+    {
+      "play": 1,
+      "turns": 720,
+      "player_0": 3121.0,
+      "player_1": 3508.0
+    },
+    {
+      "play": 2,
+      "turns": 720,
+      "player_0": 3619.0,
+      "player_1": 3514.0
+    },
+    {
+      "play": 3,
+      "turns": 720,
+      "player_0": 1122.0,
+      "player_1": 3493.0
+    },
+    {
+      "play": 4,
+      "turns": 720,
+      "player_0": 2858.0,
+      "player_1": 3507.0
+    },
+    {
+      "play": 5,
+      "turns": 720,
+      "player_0": 1761.0,
+      "player_1": 3491.0
+    },
+    {
+      "play": 6,
+      "turns": 720,
+      "player_0": 1175.0,
+      "player_1": 3503.0
+    },
+    {
+      "play": 7,
+      "turns": 720,
+      "player_0": 3049.0,
+      "player_1": 3499.0
+    },
+    {
+      "play": 8,
+      "turns": 720,
+      "player_0": 2338.0,
+      "player_1": 3499.0
+    },
+    {
+      "play": 9,
+      "turns": 720,
+      "player_0": 2933.0,
+      "player_1": 3498.0
+    },
+    {
+      "play": 10,
+      "turns": 720,
+      "player_0": 4361.0,
+      "player_1": 3495.0
+    },
+    {
+      "play": 11,
+      "turns": 720,
+      "player_0": 5979.0,
+      "player_1": 3491.0
+    },
+    {
+      "play": 12,
+      "turns": 720,
+      "player_0": 6600.0,
+      "player_1": 3491.0
+    },
+    {
+      "play": 13,
+      "turns": 720,
+      "player_0": 5284.0,
+      "player_1": 3499.0
+    },
+    {
+      "play": 14,
+      "turns": 720,
+      "player_0": 4286.0,
+      "player_1": 3512.0
+    },
+    {
+      "play": 15,
+      "turns": 720,
+      "player_0": 3376.0,
+      "player_1": 3507.0
+    },
+    {
+      "play": 16,
+      "turns": 720,
+      "player_0": 6695.0,
+      "player_1": 3497.0
+    },
+    {
+      "play": 17,
+      "turns": 720,
+      "player_0": 1833.0,
+      "player_1": 3514.0
+    },
+    {
+      "play": 18,
+      "turns": 720,
+      "player_0": 5409.0,
+      "player_1": 3501.0
+    },
+    {
+      "play": 19,
+      "turns": 720,
+      "player_0": 5986.0,
+      "player_1": 3501.0
+    },
+    {
+      "play": 20,
+      "turns": 720,
+      "player_0": 9383.0,
+      "player_1": 3487.0
+    },
+    {
+      "play": 21,
+      "turns": 720,
+      "player_0": 3476.0,
+      "player_1": 3495.0
+    },
+    {
+      "play": 22,
+      "turns": 720,
+      "player_0": 7916.0,
+      "player_1": 3514.0
+    },
+    {
+      "play": 23,
+      "turns": 720,
+      "player_0": 7208.0,
+      "player_1": 3495.0
+    },
+    {
+      "play": 24,
+      "turns": 720,
+      "player_0": 1058.0,
+      "player_1": 3501.0
+    },
+    {
+      "play": 25,
+      "turns": 720,
+      "player_0": 5249.0,
+      "player_1": 3511.0
+    },
+    {
+      "play": 26,
+      "turns": 720,
+      "player_0": 7898.0,
+      "player_1": 3512.0
+    },
+    {
+      "play": 27,
+      "turns": 720,
+      "player_0": 7256.0,
+      "player_1": 3485.0
+    },
+    {
+      "play": 28,
+      "turns": 720,
+      "player_0": 6495.0,
+      "player_1": 3512.0
+    },
+    {
+      "play": 29,
+      "turns": 720,
+      "player_0": 4629.0,
+      "player_1": 3489.0
+    },
+    {
+      "play": 30,
+      "turns": 720,
+      "player_0": 8027.0,
+      "player_1": 3481.0
+    },
+    {
+      "play": 31,
+      "turns": 720,
+      "player_0": 4662.0,
+      "player_1": 3491.0
+    },
+    {
+      "play": 32,
+      "turns": 720,
+      "player_0": 3817.0,
+      "player_1": 3507.0
+    },
+    {
+      "play": 33,
+      "turns": 720,
+      "player_0": 6159.0,
+      "player_1": 3512.0
+    },
+    {
+      "play": 34,
+      "turns": 720,
+      "player_0": 872.0,
+      "player_1": 3503.0
+    },
+    {
+      "play": 35,
+      "turns": 720,
+      "player_0": 5771.0,
+      "player_1": 3495.0
+    },
+    {
+      "play": 36,
+      "turns": 720,
+      "player_0": 4751.0,
+      "player_1": 3496.0
+    },
+    {
+      "play": 37,
+      "turns": 720,
+      "player_0": 4237.0,
+      "player_1": 3501.0
+    },
+    {
+      "play": 38,
+      "turns": 720,
+      "player_0": 8016.0,
+      "player_1": 3483.0
+    },
+    {
+      "play": 39,
+      "turns": 720,
+      "player_0": 2153.0,
+      "player_1": 3499.0
+    },
+    {
+      "play": 40,
+      "turns": 720,
+      "player_0": 3103.0,
+      "player_1": 3507.0
+    },
+    {
+      "play": 41,
+      "turns": 720,
+      "player_0": 1384.0,
+      "player_1": 3511.0
+    },
+    {
+      "play": 42,
+      "turns": 720,
+      "player_0": 5663.0,
+      "player_1": 3494.0
+    },
+    {
+      "play": 43,
+      "turns": 720,
+      "player_0": 5112.0,
+      "player_1": 3503.0
+    },
+    {
+      "play": 44,
+      "turns": 720,
+      "player_0": 2367.0,
+      "player_1": 3514.0
+    },
+    {
+      "play": 45,
+      "turns": 720,
+      "player_0": 4096.0,
+      "player_1": 3499.0
+    },
+    {
+      "play": 46,
+      "turns": 720,
+      "player_0": 6470.0,
+      "player_1": 3481.0
+    },
+    {
+      "play": 47,
+      "turns": 720,
+      "player_0": 2636.0,
+      "player_1": 3514.0
+    },
+    {
+      "play": 48,
+      "turns": 720,
+      "player_0": 5590.0,
+      "player_1": 3512.0
+    },
+    {
+      "play": 49,
+      "turns": 720,
+      "player_0": 7231.0,
+      "player_1": 3485.0
+    },
+    {
+      "play": 50,
+      "turns": 720,
+      "player_0": 7671.0,
+      "player_1": 3482.0
+    },
+    {
+      "play": 51,
+      "turns": 720,
+      "player_0": 3554.0,
+      "player_1": 3499.0
+    },
+    {
+      "play": 52,
+      "turns": 720,
+      "player_0": 3989.0,
+      "player_1": 3495.0
+    },
+    {
+      "play": 53,
+      "turns": 720,
+      "player_0": 3304.0,
+      "player_1": 3507.0
+    },
+    {
+      "play": 54,
+      "turns": 720,
+      "player_0": 6020.0,
+      "player_1": 3495.0
+    },
+    {
+      "play": 55,
+      "turns": 720,
+      "player_0": 5151.0,
+      "player_1": 3485.0
+    },
+    {
+      "play": 56,
+      "turns": 720,
+      "player_0": 3451.0,
+      "player_1": 3495.0
+    },
+    {
+      "play": 57,
+      "turns": 720,
+      "player_0": 4750.0,
+      "player_1": 3514.0
+    },
+    {
+      "play": 58,
+      "turns": 720,
+      "player_0": 3119.0,
+      "player_1": 3503.0
+    },
+    {
+      "play": 59,
+      "turns": 720,
+      "player_0": 801.0,
+      "player_1": 3499.0
+    },
+    {
+      "play": 60,
+      "turns": 720,
+      "player_0": 2977.0,
+      "player_1": 3493.0
+    },
+    {
+      "play": 61,
+      "turns": 720,
+      "player_0": 6848.0,
+      "player_1": 3491.0
+    },
+    {
+      "play": 62,
+      "turns": 720,
+      "player_0": 3114.0,
+      "player_1": 3489.0
+    },
+    {
+      "play": 63,
+      "turns": 720,
+      "player_0": 4534.0,
+      "player_1": 3491.0
+    },
+    {
+      "play": 64,
+      "turns": 720,
+      "player_0": 4416.0,
+      "player_1": 3487.0
+    },
+    {
+      "play": 65,
+      "turns": 720,
+      "player_0": 8671.0,
+      "player_1": 3485.0
+    },
+    {
+      "play": 66,
+      "turns": 720,
+      "player_0": 8004.0,
+      "player_1": 3485.0
+    },
+    {
+      "play": 67,
+      "turns": 720,
+      "player_0": 6442.0,
+      "player_1": 3483.0
+    },
+    {
+      "play": 68,
+      "turns": 720,
+      "player_0": 2127.0,
+      "player_1": 3483.0
+    },
+    {
+      "play": 69,
+      "turns": 720,
+      "player_0": 8128.0,
+      "player_1": 3485.0
+    },
+    {
+      "play": 70,
+      "turns": 720,
+      "player_0": 5209.0,
+      "player_1": 3514.0
+    },
+    {
+      "play": 71,
+      "turns": 720,
+      "player_0": 3989.0,
+      "player_1": 3485.0
+    },
+    {
+      "play": 72,
+      "turns": 720,
+      "player_0": 869.0,
+      "player_1": 3512.0
+    },
+    {
+      "play": 73,
+      "turns": 720,
+      "player_0": 2267.0,
+      "player_1": 3514.0
+    },
+    {
+      "play": 74,
+      "turns": 720,
+      "player_0": 6353.0,
+      "player_1": 3507.0
+    },
+    {
+      "play": 75,
+      "turns": 720,
+      "player_0": 6807.0,
+      "player_1": 3487.0
+    },
+    {
+      "play": 76,
+      "turns": 720,
+      "player_0": 7687.0,
+      "player_1": 3499.0
+    },
+    {
+      "play": 77,
+      "turns": 720,
+      "player_0": 1979.0,
+      "player_1": 3501.0
+    },
+    {
+      "play": 78,
+      "turns": 720,
+      "player_0": 7738.0,
+      "player_1": 3495.0
+    },
+    {
+      "play": 79,
+      "turns": 720,
+      "player_0": 6352.0,
+      "player_1": 3494.0
+    },
+    {
+      "play": 80,
+      "turns": 720,
+      "player_0": 4709.0,
+      "player_1": 3507.0
+    },
+    {
+      "play": 81,
+      "turns": 720,
+      "player_0": 3059.0,
+      "player_1": 3509.0
+    },
+    {
+      "play": 82,
+      "turns": 720,
+      "player_0": 3958.0,
+      "player_1": 3485.0
+    },
+    {
+      "play": 83,
+      "turns": 720,
+      "player_0": 3287.0,
+      "player_1": 3503.0
+    },
+    {
+      "play": 84,
+      "turns": 720,
+      "player_0": 6134.0,
+      "player_1": 3493.0
+    },
+    {
+      "play": 85,
+      "turns": 720,
+      "player_0": 8565.0,
+      "player_1": 3499.0
+    },
+    {
+      "play": 86,
+      "turns": 720,
+      "player_0": 4836.0,
+      "player_1": 3495.0
+    },
+    {
+      "play": 87,
+      "turns": 720,
+      "player_0": 6860.0,
+      "player_1": 3499.0
+    },
+    {
+      "play": 88,
+      "turns": 720,
+      "player_0": 3635.0,
+      "player_1": 3495.0
+    },
+    {
+      "play": 89,
+      "turns": 720,
+      "player_0": 4379.0,
+      "player_1": 3505.0
+    },
+    {
+      "play": 90,
+      "turns": 720,
+      "player_0": 1920.0,
+      "player_1": 3493.0
+    },
+    {
+      "play": 91,
+      "turns": 720,
+      "player_0": 3687.0,
+      "player_1": 3491.0
+    },
+    {
+      "play": 92,
+      "turns": 720,
+      "player_0": 4269.0,
+      "player_1": 3487.0
+    },
+    {
+      "play": 93,
+      "turns": 720,
+      "player_0": 4416.0,
+      "player_1": 3512.0
+    },
+    {
+      "play": 94,
+      "turns": 720,
+      "player_0": 2300.0,
+      "player_1": 3501.0
+    },
+    {
+      "play": 95,
+      "turns": 720,
+      "player_0": 5822.0,
+      "player_1": 3491.0
+    },
+    {
+      "play": 96,
+      "turns": 720,
+      "player_0": 2305.0,
+      "player_1": 3495.0
+    },
+    {
+      "play": 97,
+      "turns": 720,
+      "player_0": 6747.0,
+      "player_1": 3494.0
+    },
+    {
+      "play": 98,
+      "turns": 720,
+      "player_0": 7012.0,
+      "player_1": 3491.0
+    },
+    {
+      "play": 99,
+      "turns": 720,
+      "player_0": 4310.0,
+      "player_1": 3507.0
+    },
+    {
+      "play": 100,
+      "turns": 720,
+      "player_0": 7024.0,
+      "player_1": 3514.0
+    }
+  ],
+  "summary": {
+    "player_0": {
+      "avg": 4700.25,
+      "min": 801.0,
+      "max": 9383.0
+    },
+    "player_1": {
+      "avg": 3498.29,
+      "min": 3481.0,
+      "max": 3514.0
+    }
+  }
+}
