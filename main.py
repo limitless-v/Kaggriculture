@@ -230,106 +230,113 @@ def _build_tasks(obs, me, plot_cap):
                     animal_counts[animal] += 1
 
     tasks = []
-    for y in range(board_size):
-        row = tiles[y]
-        for x in range(board_size):
-            if _quadrant_of(x, y, half) not in unlocked:
-                continue
-            tile = row[x]
-            pos = (x, y)
+    
+    # 1. Generate all coordinates
+    coords = [(x, y) for y in range(board_size) for x in range(board_size)]
+    
+    # 2. Sort by minimum Manhattan distance to any shed tile
+    coords.sort(key=lambda pos: min(_manhattan(pos, shed) for shed in SHED_TILES))
 
-            if tile is None:
-                needed_structure = None
-                for structure, target in STRUCTURE_TARGETS.items():
-                    if structure_counts[structure] < target:
-                        needed_structure = structure
-                        break
+    # 3. Iterate over the sorted proximity list instead of nested loops
+    for x, y in coords:
+        if _quadrant_of(x, y, half) not in unlocked:
+            continue
+        
+        tile = tiles[y][x]
+        pos = (x, y)
 
-                if needed_structure is not None:
-                    tasks.append({
-                        "pos": pos,
-                        "action": ["BUILD_COOP" if needed_structure == "COOP" else "BUILD_PASTURE"],
-                        "priority": PRIORITY_BUILD_STRUCTURE,
-                    })
-                    structure_counts[needed_structure] += 1
-                    continue
+        if tile is None:
+            needed_structure = None
+            for structure, target in STRUCTURE_TARGETS.items():
+                if structure_counts[structure] < target:
+                    needed_structure = structure
+                    break
 
-                if active_plots >= plot_cap:
-                    continue
-                crop = CROP_ROTATION[(x * board_size + y) % len(CROP_ROTATION)]
-                tasks.append({"pos": pos, "action": ["PLANT", crop], "priority": PRIORITY_PLANT})
-                active_plots += 1
-                continue
-
-            if not isinstance(tile, dict):
-                continue
-            kind = tile.get("kind")
-
-            if kind == "WEED":
-                tasks.append({"pos": pos, "action": ["DIG"], "priority": PRIORITY_WEED})
+            if needed_structure is not None:
+                tasks.append({
+                    "pos": pos,
+                    "action": ["BUILD_COOP" if needed_structure == "COOP" else "BUILD_PASTURE"],
+                    "priority": PRIORITY_BUILD_STRUCTURE,
+                })
+                structure_counts[needed_structure] += 1
                 continue
 
-            if kind == "PLANT":
-                crop = tile["crop"]
-                cfg = CROP_CONFIG.get(crop)
-                if cfg is None:
-                    continue
-                yield_units = tile.get("yield_units", 0)
-                watered = tile.get("watered_today", False)
-                lifespan_step = tile.get("max_lifespan_step", -1)
-                decaying_soon = lifespan_step != -1 and step >= lifespan_step - HARVEST_LEAD_TURNS
-                fertilized_until = tile.get("fertilized_until_day", -1)
-                age = day - tile.get("planted_day", day)
+            if active_plots >= plot_cap:
+                continue
+            crop = CROP_ROTATION[(x * board_size + y) % len(CROP_ROTATION)]
+            tasks.append({"pos": pos, "action": ["PLANT", crop], "priority": PRIORITY_PLANT})
+            active_plots += 1
+            continue
 
-                if yield_units > 0 and decaying_soon:
-                    tasks.append({"pos": pos, "action": ["HARVEST"], "priority": PRIORITY_URGENT_HARVEST})
-                elif yield_units > 0 and cfg["ongoing"]:
-                    tasks.append({"pos": pos, "action": ["HARVEST"], "priority": PRIORITY_HARVEST_ONGOING})
-                elif not watered:
-                    cu = tile.get("consecutive_unwatered", 0)
-                    tasks.append({"pos": pos, "action": ["WATER"],
-                                   "priority": PRIORITY_WATER_BASE + cu * 20})
-                elif cfg["ongoing"] and fertilized_until < day:
-                    tasks.append({"pos": pos, "action": ["FERTILIZE"],
-                                   "priority": PRIORITY_FERTILIZE_ONGOING,
-                                   "requires_carry": "FERTILIZER", "carry_qty": FERTILIZER_FETCH_QTY})
-                elif (not cfg["ongoing"] and fertilized_until < day
-                      and cfg["bonus_window"][0] <= age <= cfg["bonus_window"][1]):
-                    tasks.append({"pos": pos, "action": ["FERTILIZE"],
-                                   "priority": PRIORITY_FERTILIZE_ONETIME,
-                                   "requires_carry": "FERTILIZER", "carry_qty": FERTILIZER_FETCH_QTY})
+        if not isinstance(tile, dict):
+            continue
+        kind = tile.get("kind")
+
+        if kind == "WEED":
+            tasks.append({"pos": pos, "action": ["DIG"], "priority": PRIORITY_WEED})
+            continue
+
+        if kind == "PLANT":
+            crop = tile["crop"]
+            cfg = CROP_CONFIG.get(crop)
+            if cfg is None:
+                continue
+            yield_units = tile.get("yield_units", 0)
+            watered = tile.get("watered_today", False)
+            lifespan_step = tile.get("max_lifespan_step", -1)
+            decaying_soon = lifespan_step != -1 and step >= lifespan_step - HARVEST_LEAD_TURNS
+            fertilized_until = tile.get("fertilized_until_day", -1)
+            age = day - tile.get("planted_day", day)
+
+            if yield_units > 0 and decaying_soon:
+                tasks.append({"pos": pos, "action": ["HARVEST"], "priority": PRIORITY_URGENT_HARVEST})
+            elif yield_units > 0 and cfg["ongoing"]:
+                tasks.append({"pos": pos, "action": ["HARVEST"], "priority": PRIORITY_HARVEST_ONGOING})
+            elif not watered:
+                cu = tile.get("consecutive_unwatered", 0)
+                tasks.append({"pos": pos, "action": ["WATER"],
+                               "priority": PRIORITY_WATER_BASE + cu * 20})
+            elif cfg["ongoing"] and fertilized_until < day:
+                tasks.append({"pos": pos, "action": ["FERTILIZE"],
+                               "priority": PRIORITY_FERTILIZE_ONGOING,
+                               "requires_carry": "FERTILIZER", "carry_qty": FERTILIZER_FETCH_QTY})
+            elif (not cfg["ongoing"] and fertilized_until < day
+                  and cfg["bonus_window"][0] <= age <= cfg["bonus_window"][1]):
+                tasks.append({"pos": pos, "action": ["FERTILIZE"],
+                               "priority": PRIORITY_FERTILIZE_ONETIME,
+                               "requires_carry": "FERTILIZER", "carry_qty": FERTILIZER_FETCH_QTY})
+            continue
+
+        if kind in ("COOP", "PASTURE"):
+            animal = tile.get("animal")
+            if animal is None:
+                candidates = [a for a, cfg in ANIMAL_CONFIG.items()
+                              if cfg["structure"] == kind and animal_counts[a] < ANIMAL_TARGETS[a]]
+                if candidates:
+                    target_animal = candidates[0]
+                    tasks.append({"pos": pos, "action": ["PLACE", target_animal],
+                                   "priority": PRIORITY_PLACE_ANIMAL,
+                                   "requires_carry": target_animal, "carry_qty": 1})
                 continue
 
-            if kind in ("COOP", "PASTURE"):
-                animal = tile.get("animal")
-                if animal is None:
-                    candidates = [a for a, cfg in ANIMAL_CONFIG.items()
-                                  if cfg["structure"] == kind and animal_counts[a] < ANIMAL_TARGETS[a]]
-                    if candidates:
-                        target_animal = candidates[0]
-                        tasks.append({"pos": pos, "action": ["PLACE", target_animal],
-                                       "priority": PRIORITY_PLACE_ANIMAL,
-                                       "requires_carry": target_animal, "carry_qty": 1})
-                    continue
+            yield_units = tile.get("yield_units", 0)
+            fed_today = tile.get("fed_today", False)
+            consecutive_unfed = tile.get("consecutive_unfed", 0)
+            cared_today = tile.get("cared_today", False)
+            fertilizer_available = tile.get("fertilizer_available", False)
 
-                yield_units = tile.get("yield_units", 0)
-                fed_today = tile.get("fed_today", False)
-                consecutive_unfed = tile.get("consecutive_unfed", 0)
-                cared_today = tile.get("cared_today", False)
-                fertilizer_available = tile.get("fertilizer_available", False)
-
-                if not fed_today:
-                    tasks.append({"pos": pos, "action": ["FEED"],
-                                   "priority": PRIORITY_FEED + consecutive_unfed * 20,
-                                   "requires_carry": "WHEAT", "carry_qty": 1})
-                elif yield_units > 0:
-                    tasks.append({"pos": pos, "action": ["HARVEST"], "priority": PRIORITY_ANIMAL_HARVEST})
-                elif not cared_today:
-                    tasks.append({"pos": pos, "action": ["CARE"], "priority": PRIORITY_CARE})
-                elif fertilizer_available:
-                    tasks.append({"pos": pos, "action": ["COLLECT_FERTILIZER"],
-                                   "priority": PRIORITY_COLLECT_FERTILIZER})
-                continue
+            if not fed_today:
+                tasks.append({"pos": pos, "action": ["FEED"],
+                               "priority": PRIORITY_FEED + consecutive_unfed * 20,
+                               "requires_carry": "WHEAT", "carry_qty": 1})
+            elif yield_units > 0:
+                tasks.append({"pos": pos, "action": ["HARVEST"], "priority": PRIORITY_ANIMAL_HARVEST})
+            elif not cared_today:
+                tasks.append({"pos": pos, "action": ["CARE"], "priority": PRIORITY_CARE})
+            elif fertilizer_available:
+                tasks.append({"pos": pos, "action": ["COLLECT_FERTILIZER"],
+                               "priority": PRIORITY_COLLECT_FERTILIZER})
+            continue
 
     tasks.sort(key=lambda t: -t["priority"])
     return tasks
