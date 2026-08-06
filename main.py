@@ -562,31 +562,31 @@ def _build_market_orders(obs, me, private, market, step, animal_targets):
     # --- Buy animals, gated on an actual free structure slot ---------------
     # (See module docstring: buying ahead of a structure existing is the bug
     # that was stranding capital idle for 12-24 days.)
-    # --- Buy animals, gated on an actual free structure slot ---
+    # --- Buy animals (Pre-buying allowed) ---
     placed = _animal_shortfall(me)
-    structures = _structure_counts(me)
-    structure_occupied = {"COOP": 0, "PASTURE": 0}
-    for a, cfg in ANIMAL_CONFIG.items():
-        structure_occupied[cfg["structure"]] += placed.get(a, 0)
-    structure_reserved = {"COOP": 0, "PASTURE": 0}
-    for a, cfg in ANIMAL_CONFIG.items():
-        structure_reserved[cfg["structure"]] += shed.get(a, 0)
-
+    
     for animal, target in animal_targets.items():
         if len(orders) >= 10:
             break
+            
         cfg = ANIMAL_CONFIG[animal]
-        structure = cfg["structure"]
-        free_slots = (structures[structure]
-                      - structure_occupied[structure]
-                      - structure_reserved[structure])
-        already_owned = placed.get(animal, 0) + shed.get(animal, 0)
         cost = cfg["cost"]
-        if (already_owned < target and free_slots > 0
-                and money - CASH_RESERVE >= cost):
-            orders.append(["BUY_ANIMAL", animal, 1])
-            money -= cost
-            structure_reserved[structure] += 1  # claim the slot this turn
+        
+        # Tally what is on the board, in the shed, and currently in transit
+        already_owned = placed.get(animal, 0) + shed.get(animal, 0)
+        carried = sum(_carried_count(private, i, animal) for i in range(len(private.get("inventories", []))))
+        total_owned = already_owned + carried
+        
+        shortfall = target - total_owned
+        
+        if shortfall > 0 and money - CASH_RESERVE >= cost:
+            # Buy as many as we need and can afford instantly, ignoring structure status
+            affordable = int((money - CASH_RESERVE) // cost)
+            buy_qty = min(shortfall, affordable)
+            
+            if buy_qty > 0:
+                orders.append(["BUY_ANIMAL", animal, buy_qty])
+                money -= cost * buy_qty
 
     # --- Price-aware drip-sell of shed contents ---
     # Ensure we don't accidentally sell our live animals using ANIMAL_CONFIG
