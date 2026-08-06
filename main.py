@@ -321,6 +321,9 @@ def _build_tasks(obs, me, plot_cap, market, private, animal_targets):
 
             if yield_units > 0 and decaying_soon:
                 tasks.append({"pos": pos, "action": ["HARVEST"], "priority": PRIORITY_URGENT_HARVEST})
+            elif yield_units == cfg["max_yield"]:
+                # Harvest instantly when max yield is reached, don't wait for decay
+                tasks.append({"pos": pos, "action": ["HARVEST"], "priority": PRIORITY_HARVEST_ONGOING + 5})
             elif yield_units > 0 and cfg["ongoing"]:
                 tasks.append({"pos": pos, "action": ["HARVEST"], "priority": PRIORITY_HARVEST_ONGOING})
             elif not watered:
@@ -613,43 +616,51 @@ def _build_market_orders(obs, me, private, market, step, animal_targets):
         for t in row:
             if isinstance(t, dict) and t.get("kind") == "PLANT":
                 crop = t.get("crop")
-                # Only buy market fertilizer if the yield bonus massively outweighs the $100 cost
                 if crop == "MELON":
                     cfg = CROP_CONFIG[crop]
                     age = obs["day"] - t.get("planted_day", obs["day"])
                     fertilized_until = t.get("fertilized_until_day", -1)
-                    
-                    # Tally demand if it is in the window and currently unfertilized
                     if fertilized_until < obs["day"] and cfg["bonus_window"][0] <= age <= cfg["bonus_window"][1]:
                         fertilizer_demand += 1
 
-    fertilizer_shortfall = fertilizer_demand - shed.get("FERTILIZER", 0)
+    # FIX: Account for fertilizer currently being carried by units so we don't infinitely re-buy
+    carried_fert = sum(_carried_count(private, i, "FERTILIZER") for i in range(len(private.get("inventories", []))))
+    fertilizer_shortfall = fertilizer_demand - (shed.get("FERTILIZER", 0) + carried_fert)
     
     if fertilizer_shortfall > 0 and len(orders) < 10:
         market_inv = inventory.get("FERTILIZER", MARKET_PARAMS["FERTILIZER"]["I0"])
-        
-        # Cap the purchase by our available budget and safety margins
         buy_qty = min(
             fertilizer_shortfall,
             _max_buy_qty("FERTILIZER", market_inv, money, CASH_RESERVE, max_rise_frac=MAX_PRICE_RISE_FRAC)
         )
-        
         if buy_qty > 0:
             orders.append(["BUY_PRODUCT", "FERTILIZER", buy_qty])
-            # Deduct the approximate cost so subsequent seed/wheat orders don't double-spend
             money -= buy_qty * _price_at("FERTILIZER", market_inv)
 
-    # --- Keep seed stock topped up -------------------------------------------
-    for crop in CROP_CONFIG:
+    # --- Keep seed stock topped up (Optimized) ---
+    # Determine the single best crop to plant right now so we don't buy useless seeds
+    best_crop_to_buy = "WHEAT"
+    best_roi = -float('inf')
+    for c, c_cfg in CROP_CONFIG.items():
+        roi = (prices.get(c, c_cfg["base_price"]) * c_cfg["max_yield"]) - c_cfg["seed_cost"]
+        if roi > best_roi:
+            best_roi = roi
+            best_crop_to_buy = c
+
+    # Only buy seeds we actually intend to plant, plus Wheat (always needed for animal feed)
+    target_seeds = {"WHEAT", best_crop_to_buy}
+    
+    for crop in target_seeds:
         if len(orders) >= 10:
             break
         cost = CROP_CONFIG[crop]["seed_cost"]
         have = seeds.get(crop, 0)
-        if have < 3 and money >= cost + CASH_RESERVE:
+        if have < 5 and money >= cost + CASH_RESERVE:
             buy_n = min(5, int((money - CASH_RESERVE) // cost))
             if buy_n > 0:
                 orders.append(["BUY_SEED", crop, buy_n])
                 money -= buy_n * cost
+
 
     # --- Keep wheat feed buffer topped up via BUY_PRODUCT --------------------
     if len(orders) < 10 and shed.get("WHEAT", 0) < WHEAT_FEED_BUFFER:
