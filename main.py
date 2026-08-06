@@ -87,7 +87,7 @@ ANIMAL_CONFIG = {
     "SHEEP": {"structure": "PASTURE", "product": "WOOL", "cost": 500, "base_price": 200,
                "first_yield_day": 6, "interval_days": 3, "max_held": 6},
 }
-ANIMAL_TARGETS = {"GOOSE": 1, "COW": 1, "SHEEP": 1}
+
 STRUCTURE_TARGETS = {"COOP": 1, "PASTURE": 2}
 
 WHEAT_FEED_BUFFER = 10
@@ -204,7 +204,7 @@ def _nearest_shed_tile(pos):
 # Task queue
 # ---------------------------------------------------------------------------
 
-def _build_tasks(obs, me, plot_cap, market, private):
+def _build_tasks(obs, me, plot_cap, market, private, animal_targets):
     step = obs.get("step", obs["day"] * TURNS_PER_DAY + obs["hour"])
     day = obs["day"]
     tiles = me["tiles"]
@@ -337,9 +337,17 @@ def _build_tasks(obs, me, plot_cap, market, private):
         if kind in ("COOP", "PASTURE"):
             animal = tile.get("animal")
             if animal is None:
-                candidates = [a for a, cfg in ANIMAL_CONFIG.items()
-                              if cfg["structure"] == kind and animal_counts[a] < ANIMAL_TARGETS[a]]
+                shed = private.get("shed", {})
+                candidates = []
+                for a, a_cfg in ANIMAL_CONFIG.items():
+                    if a_cfg["structure"] == kind:
+                        # Place if we are below target, OR if we already own one in the shed
+                        if animal_counts.get(a, 0) < animal_targets.get(a, 0) or shed.get(a, 0) > 0:
+                            candidates.append(a)
+                
                 if candidates:
+                    # Sort so animals we already own take priority over planned targets
+                    candidates.sort(key=lambda a: (-shed.get(a, 0), -animal_targets.get(a, 0)))
                     target_animal = candidates[0]
                     tasks.append({"pos": pos, "action": ["PLACE", target_animal],
                                    "priority": PRIORITY_PLACE_ANIMAL,
@@ -521,7 +529,7 @@ def _structure_counts(me):
     return counts
 
 
-def _build_market_orders(obs, me, private, market, step):
+def _build_market_orders(obs, me, private, market, step, animal_targets):
     shed = private.get("shed", {})
     seeds = private.get("seeds", {})
     money = me["money"]
@@ -550,6 +558,7 @@ def _build_market_orders(obs, me, private, market, step):
     # --- Buy animals, gated on an actual free structure slot ---------------
     # (See module docstring: buying ahead of a structure existing is the bug
     # that was stranding capital idle for 12-24 days.)
+    # --- Buy animals, gated on an actual free structure slot ---
     placed = _animal_shortfall(me)
     structures = _structure_counts(me)
     structure_occupied = {"COOP": 0, "PASTURE": 0}
@@ -559,7 +568,7 @@ def _build_market_orders(obs, me, private, market, step):
     for a, cfg in ANIMAL_CONFIG.items():
         structure_reserved[cfg["structure"]] += shed.get(a, 0)
 
-    for animal, target in ANIMAL_TARGETS.items():
+    for animal, target in animal_targets.items():
         if len(orders) >= 10:
             break
         cfg = ANIMAL_CONFIG[animal]
@@ -575,9 +584,10 @@ def _build_market_orders(obs, me, private, market, step):
             money -= cost
             structure_reserved[structure] += 1  # claim the slot this turn
 
-    # --- Price-aware drip-sell of shed contents -----------------------------
+    # --- Price-aware drip-sell of shed contents ---
+    # Ensure we don't accidentally sell our live animals using ANIMAL_CONFIG
     sellable = [(item, count) for item, count in shed.items()
-                if count > 0 and item not in ANIMAL_TARGETS]
+                if count > 0 and item not in ANIMAL_CONFIG]
     sellable.sort(key=lambda kv: -prices.get(kv[0], 1))
 
     for item, count in sellable:
@@ -616,6 +626,29 @@ def _build_market_orders(obs, me, private, market, step):
 
     return orders[:10]
 
+def _get_dynamic_animal_targets(market):
+    prices = market.get("prices", {})
+    targets = {a: 0 for a in ANIMAL_CONFIG}
+    
+    for struct, max_structs in STRUCTURE_TARGETS.items():
+        best_animal = None
+        best_roi = -float('inf')
+        
+        for a, cfg in ANIMAL_CONFIG.items():
+            if cfg["structure"] == struct:
+                prod_price = prices.get(cfg["product"], cfg["base_price"])
+                # ROI: Daily revenue divided by upfront cost
+                roi = (prod_price / cfg["interval_days"]) / cfg["cost"]
+                
+                if roi > best_roi:
+                    best_roi = roi
+                    best_animal = a
+                    
+        if best_animal:
+            targets[best_animal] = max_structs
+            
+    return targets
+
 
 def agent(obs):
     player = obs["player"]
@@ -630,16 +663,18 @@ def agent(obs):
 
     plot_cap = PLOTS_PER_UNIT * len(units)
 
-    # Pass the market and private parameters here
-    tasks = _build_tasks(obs, me, plot_cap, market, private)
-    
+    # 1. Dynamically rank and assign animal targets 
+    animal_targets = _get_dynamic_animal_targets(market)
+
+    # 2. Pass the targets down the pipeline
+    tasks = _build_tasks(obs, me, plot_cap, market, private, animal_targets)
     assignment = _assign_tasks(units, tasks, private, private.get("shed", {}))
     unit_actions = _build_unit_actions(units, assignment)
 
     farmer_action = unit_actions.get("farmer", ["PASS"])
     hand_actions = [unit_actions[f"hand{i}"] for i in range(len(me.get("hands", [])))]
 
-    market_orders = _build_market_orders(obs, me, private, market, step)
+    market_orders = _build_market_orders(obs, me, private, market, step, animal_targets)
 
     return {"farmer": farmer_action, "hands": hand_actions, "market": market_orders}
 
