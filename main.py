@@ -339,7 +339,7 @@ def _build_tasks(obs, me, plot_cap, market, private, animal_targets, town_demand
                 
                 # OPPONENT META & DIVERSIFICATION
                 total_market_exposure = crop_counts[c] + opp_state.get(c, 0)
-                raw_penalty = total_market_exposure * (current_price * 0.10)
+                raw_penalty = total_market_exposure * (current_price * 0.02)
                 penalty = min(raw_penalty, expected_profit * 0.50)
                 
                 score = expected_profit - penalty
