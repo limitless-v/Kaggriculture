@@ -117,6 +117,27 @@ MARKET_PARAMS = {
                     "above_func": "linear", "above_target": 0.40},
 }
 
+# ---------------------------------------------------------------------------
+# Town Demand Mapping
+# ---------------------------------------------------------------------------
+TOWN_SHOPS = {
+    "BAKERY": ["EGG", "WHEAT"],
+    "YARN_STORE": ["WOOL", "WOOL"],
+    "DAIRY": ["MILK", "MILK"],
+    "GREENGROCER": ["CARROT", "TOMATO"],
+    "FRUIT_STAND": ["MELON", "STRAWBERRY"]
+}
+
+def _get_town_demand(obs):
+    """Calculates active town demand for each product."""
+    # Base demand: Town Center consumes 1 of everything every 12 turns
+    demand = {item: 1 for item in MARKET_PARAMS}
+    
+    for shop in obs.get("town", {}).get("unlocked_shops", []):
+        for item in TOWN_SHOPS.get(shop, []):
+            demand[item] += 1
+            
+    return demand
 
 def _shape(name, x):
     if name == "linear":
@@ -204,7 +225,7 @@ def _nearest_shed_tile(pos):
 # Task queue
 # ---------------------------------------------------------------------------
 
-def _build_tasks(obs, me, plot_cap, market, private, animal_targets):
+def _build_tasks(obs, me, plot_cap, market, private, animal_targets, town_demand):
     step = obs.get("step", obs["day"] * TURNS_PER_DAY + obs["hour"])
     day = obs["day"]
     tiles = me["tiles"]
@@ -264,7 +285,7 @@ def _build_tasks(obs, me, plot_cap, market, private, animal_targets):
             if active_plots >= plot_cap:
                 continue
                 
-            # --- Dynamic Crop-Mix Rebalancing (With Bottom Line) ---
+            # --- Dynamic Crop-Mix Rebalancing (With Bottom Line & Town Demand) ---
             prices = market.get("prices", {})
             best_crop = "WHEAT"
             best_score = -float('inf')
@@ -274,12 +295,12 @@ def _build_tasks(obs, me, plot_cap, market, private, animal_targets):
                     continue  # Skip crops we don't have seeds for right now
 
                 current_price = prices.get(c, cfg["base_price"])
-                expected_profit = (current_price * cfg["max_yield"]) - cfg["seed_cost"]
+                
+                # TOWN DEMAND META: Boost projected price by 5% per unit of town demand
+                boosted_price = current_price * (1 + (town_demand.get(c, 1) * 0.05))
+                expected_profit = (boosted_price * cfg["max_yield"]) - cfg["seed_cost"]
                 
                 # Softened penalty with a bottom line
-                # 10% penalty per active plot, but capped at 50% of expected profit
-                # This ensures a massively profitable crop like Melon never gets 
-                # penalized completely out of consideration.
                 raw_penalty = crop_counts[c] * (current_price * 0.10)
                 penalty = min(raw_penalty, expected_profit * 0.50)
                 
@@ -289,7 +310,7 @@ def _build_tasks(obs, me, plot_cap, market, private, animal_targets):
                     best_score = score
                     best_crop = c
 
-            # Fallback if out of all seeds (will fail execution, but market auto-buys next turn)
+            # Fallback if out of all seeds
             if best_score == -float('inf'):
                 best_crop = "WHEAT"
 
@@ -536,7 +557,7 @@ def _structure_counts(me):
     return counts
 
 
-def _build_market_orders(obs, me, private, market, step, animal_targets):
+def _build_market_orders(obs, me, private, market, step, animal_targets, town_demand):
     shed = private.get("shed", {})
     seeds = private.get("seeds", {})
     money = me["money"]
@@ -592,10 +613,12 @@ def _build_market_orders(obs, me, private, market, step, animal_targets):
             structure_reserved[structure] += 1  # claim the slot this turn
 
     # --- Price-aware drip-sell of shed contents ---
-    # Ensure we don't accidentally sell our live animals using ANIMAL_CONFIG
+    # Ensure we don't accidentally sell our live animals
     sellable = [(item, count) for item, count in shed.items()
                 if count > 0 and item not in ANIMAL_CONFIG]
-    sellable.sort(key=lambda kv: -prices.get(kv[0], 1))
+    
+    # Prioritize selling items with the highest current price * demand
+    sellable.sort(key=lambda kv: -(prices.get(kv[0], 1) * town_demand.get(kv[0], 1)))
 
     for item, count in sellable:
         if len(orders) >= 10:
@@ -605,7 +628,13 @@ def _build_market_orders(obs, me, private, market, step, animal_targets):
             available = max(0, count - WHEAT_FEED_BUFFER)
 
         market_inv = inventory.get(item, MARKET_PARAMS.get(item, {}).get("I0", 10000))
-        qty = _max_sell_qty(item, market_inv, available, max_drop_frac=MAX_PRICE_DROP_FRAC)
+        
+        # TOWN DEMAND AWARE SELLING:
+        # If the town heavily demands this item, they will drain the market inventory for us.
+        # Therefore, we restrict how much we are willing to crash the price ourselves.
+        dynamic_drop_frac = MAX_PRICE_DROP_FRAC / max(1, town_demand.get(item, 1))
+        
+        qty = _max_sell_qty(item, market_inv, available, max_drop_frac=dynamic_drop_frac)
         if qty <= 0:
             continue
         orders.append(["SELL", item, qty])
@@ -673,7 +702,7 @@ def _build_market_orders(obs, me, private, market, step, animal_targets):
 
     return orders[:10]
 
-def _get_dynamic_animal_targets(market):
+def _get_dynamic_animal_targets(market, town_demand):
     prices = market.get("prices", {})
     targets = {a: 0 for a in ANIMAL_CONFIG}
     
@@ -684,8 +713,12 @@ def _get_dynamic_animal_targets(market):
         for a, cfg in ANIMAL_CONFIG.items():
             if cfg["structure"] == struct:
                 prod_price = prices.get(cfg["product"], cfg["base_price"])
+                
+                # TOWN DEMAND META: Boost projected price by 5% per unit of town demand
+                boosted_price = prod_price * (1 + (town_demand.get(cfg["product"], 1) * 0.05))
+                
                 # ROI: Daily revenue divided by upfront cost
-                roi = (prod_price / cfg["interval_days"]) / cfg["cost"]
+                roi = (boosted_price / cfg["interval_days"]) / cfg["cost"]
                 
                 if roi > best_roi:
                     best_roi = roi
@@ -710,18 +743,21 @@ def agent(obs):
 
     plot_cap = PLOTS_PER_UNIT * len(units)
 
-    # 1. Dynamically rank and assign animal targets 
-    animal_targets = _get_dynamic_animal_targets(market)
+    # 1. Parse Town Demand
+    town_demand = _get_town_demand(obs)
 
-    # 2. Pass the targets down the pipeline
-    tasks = _build_tasks(obs, me, plot_cap, market, private, animal_targets)
+    # 2. Dynamically rank and assign animal targets 
+    animal_targets = _get_dynamic_animal_targets(market, town_demand)
+
+    # 3. Pass the targets and demand down the pipeline
+    tasks = _build_tasks(obs, me, plot_cap, market, private, animal_targets, town_demand)
     assignment = _assign_tasks(units, tasks, private, private.get("shed", {}))
     unit_actions = _build_unit_actions(units, assignment)
 
     farmer_action = unit_actions.get("farmer", ["PASS"])
     hand_actions = [unit_actions[f"hand{i}"] for i in range(len(me.get("hands", [])))]
 
-    market_orders = _build_market_orders(obs, me, private, market, step, animal_targets)
+    market_orders = _build_market_orders(obs, me, private, market, step, animal_targets, town_demand)
 
     return {"farmer": farmer_action, "hands": hand_actions, "market": market_orders}
 
