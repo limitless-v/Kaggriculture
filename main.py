@@ -204,7 +204,7 @@ def _nearest_shed_tile(pos):
 # Task queue
 # ---------------------------------------------------------------------------
 
-def _build_tasks(obs, me, plot_cap):
+def _build_tasks(obs, me, plot_cap, market, private):
     step = obs.get("step", obs["day"] * TURNS_PER_DAY + obs["hour"])
     day = obs["day"]
     tiles = me["tiles"]
@@ -215,6 +215,10 @@ def _build_tasks(obs, me, plot_cap):
     active_plots = 0
     structure_counts = {"COOP": 0, "PASTURE": 0}
     animal_counts = {a: 0 for a in ANIMAL_CONFIG}
+    
+    # Track current crops and available seeds for dynamic planting
+    crop_counts = {c: 0 for c in CROP_CONFIG}
+    available_seeds = {c: private.get("seeds", {}).get(c, 0) for c in CROP_CONFIG}
 
     for y in range(board_size):
         for x in range(board_size):
@@ -223,6 +227,7 @@ def _build_tasks(obs, me, plot_cap):
                 continue
             if t.get("kind") == "PLANT":
                 active_plots += 1
+                crop_counts[t.get("crop")] += 1
             elif t.get("kind") in ("COOP", "PASTURE"):
                 structure_counts[t["kind"]] += 1
                 animal = t.get("animal")
@@ -230,18 +235,13 @@ def _build_tasks(obs, me, plot_cap):
                     animal_counts[animal] += 1
 
     tasks = []
-    
-    # 1. Generate all coordinates
     coords = [(x, y) for y in range(board_size) for x in range(board_size)]
-    
-    # 2. Sort by minimum Manhattan distance to any shed tile
     coords.sort(key=lambda pos: min(_manhattan(pos, shed) for shed in SHED_TILES))
 
-    # 3. Iterate over the sorted proximity list instead of nested loops
     for x, y in coords:
         if _quadrant_of(x, y, half) not in unlocked:
             continue
-        
+            
         tile = tiles[y][x]
         pos = (x, y)
 
@@ -263,9 +263,36 @@ def _build_tasks(obs, me, plot_cap):
 
             if active_plots >= plot_cap:
                 continue
-            crop = CROP_ROTATION[(x * board_size + y) % len(CROP_ROTATION)]
-            tasks.append({"pos": pos, "action": ["PLANT", crop], "priority": PRIORITY_PLANT})
+                
+            # --- Dynamic Crop-Mix Rebalancing ---
+            prices = market.get("prices", {})
+            best_crop = "WHEAT"
+            best_score = -float('inf')
+
+            for c, cfg in CROP_CONFIG.items():
+                if available_seeds[c] <= 0:
+                    continue  # Skip crops we don't have seeds for right now
+
+                current_price = prices.get(c, cfg["base_price"])
+                expected_profit = (current_price * cfg["max_yield"]) - cfg["seed_cost"]
+                
+                # Penalty: Subtract a percentage of the price for every active plot of this crop
+                # This naturally forces diversification as a crop saturates our farm
+                penalty = crop_counts[c] * (current_price * 0.5)
+                score = expected_profit - penalty
+
+                if score > best_score:
+                    best_score = score
+                    best_crop = c
+
+            # Fallback if out of all seeds (will fail execution, but market auto-buys next turn)
+            if best_score == -float('inf'):
+                best_crop = "WHEAT"
+
+            tasks.append({"pos": pos, "action": ["PLANT", best_crop], "priority": PRIORITY_PLANT})
             active_plots += 1
+            crop_counts[best_crop] += 1
+            available_seeds[best_crop] -= 1
             continue
 
         if not isinstance(tile, dict):
@@ -603,7 +630,9 @@ def agent(obs):
 
     plot_cap = PLOTS_PER_UNIT * len(units)
 
-    tasks = _build_tasks(obs, me, plot_cap)
+    # Pass the market and private parameters here
+    tasks = _build_tasks(obs, me, plot_cap, market, private)
+    
     assignment = _assign_tasks(units, tasks, private, private.get("shed", {}))
     unit_actions = _build_unit_actions(units, assignment)
 
