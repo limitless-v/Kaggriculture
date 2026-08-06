@@ -337,9 +337,8 @@ def _build_tasks(obs, me, plot_cap, market, private, animal_targets, town_demand
                 boosted_price = current_price * (1 + (town_demand.get(c, 1) * 0.05))
                 expected_profit = (boosted_price * cfg["max_yield"]) - cfg["seed_cost"]
                 
-                # OPPONENT META & DIVERSIFICATION
-                total_market_exposure = crop_counts[c] + opp_state.get(c, 0)
-                raw_penalty = total_market_exposure * (current_price * 0.02)
+                # Softened penalty with a bottom line
+                raw_penalty = crop_counts[c] * (current_price * 0.02)
                 penalty = min(raw_penalty, expected_profit * 0.50)
                 
                 score = expected_profit - penalty
@@ -522,7 +521,7 @@ def _build_unit_actions(units, assignment):
 FARM_HAND_COST_MULT = 1
 HIRE_COST_CEILING = 13
 MAX_HIRES_PER_DAY = 7
-CASH_RESERVE = 200
+#CASH_RESERVE = 200
 
 LAND_ORDER = ["NE", "SW", "SE"]
 LAND_COST = {"NE": 1000, "SW": 2000, "SE": 4000}
@@ -536,26 +535,32 @@ def _fib(n):
     return a
 
 
-def _plan_hires(money, hires_today):
+def _plan_hires(money, hires_today, current_hands, unlocked_count, dynamic_reserve):
+    target_total_units = (unlocked_count * 24) // PLOTS_PER_UNIT
+    target_hands = max(0, target_total_units - 1)
+    allowed_new_hires = max(0, target_hands - current_hands)
+    
     n = hires_today
-    budget = money - CASH_RESERVE
+    budget = money - dynamic_reserve
     planned = 0
-    while planned < MAX_HIRES_PER_DAY:
+    
+    while planned < MAX_HIRES_PER_DAY and planned < allowed_new_hires:
         cost = FARM_HAND_COST_MULT * _fib(n)
         if cost > HIRE_COST_CEILING or cost > budget:
             break
         budget -= cost
         n += 1
         planned += 1
+        
     return planned
 
 
-def _plan_land_purchase(unlocked, money):
+def _plan_land_purchase(unlocked, money, dynamic_reserve):
     for quadrant in LAND_ORDER:
         if quadrant in unlocked:
             continue
         cost = LAND_COST[quadrant]
-        if money - cost >= CASH_RESERVE + LAND_BUFFER:
+        if money - cost >= dynamic_reserve + LAND_BUFFER:
             return quadrant
         return None
     return None
@@ -600,16 +605,43 @@ def _build_market_orders(obs, me, private, market, step, animal_targets, town_de
     unlocked = set(me["unlocked_quadrants"])
     hires_today = me.get("hires_today", 0)
 
+# --- 1. CALCULATE DYNAMIC CASH RESERVE ---
+    active_plots = 0
+    total_animals = 0
+    
+    # Count plots and placed animals
+    for row in me["tiles"]:
+        for t in row:
+            if isinstance(t, dict):
+                if t.get("kind") == "PLANT":
+                    active_plots += 1
+                elif t.get("kind") in ("COOP", "PASTURE") and t.get("animal") is not None:
+                    total_animals += 1
+                    
+    # Add unplaced animals currently in the shed
+    for a in ANIMAL_CONFIG:
+        total_animals += shed.get(a, 0)
+        
+    # The new living reserve formula
+    dynamic_reserve = 200 + (total_animals * 50) + (active_plots * 20)
+    # -----------------------------------------
+
     orders = []
 
-    # --- Land purchase ---
-    quadrant = _plan_land_purchase(unlocked, money)
+    # --- Land purchase --------------------------------------------------
+    quadrant = _plan_land_purchase(unlocked, money, dynamic_reserve)
     if quadrant is not None:
         orders.append(["BUY_LAND"])
         money -= LAND_COST[quadrant]
 
-    # --- Hire hands ---
-    n_hires = _plan_hires(money, hires_today)
+    # --- Hire hands -------------------------------------------------------
+    # Define the missing variables based on your current state
+    current_hands = len(me.get("hands", []))
+    unlocked_count = len(unlocked)
+    
+    # Pass all 5 required arguments to the function
+    n_hires = _plan_hires(money, hires_today, current_hands, unlocked_count, dynamic_reserve)
+    
     for _ in range(n_hires):
         if len(orders) >= 10:
             break
@@ -631,8 +663,8 @@ def _build_market_orders(obs, me, private, market, step, animal_targets, town_de
         total_owned = already_owned + carried
         shortfall = target - total_owned
         
-        if shortfall > 0 and money - CASH_RESERVE >= cost:
-            affordable = int((money - CASH_RESERVE) // cost)
+        if shortfall > 0 and money - dynamic_reserve >= cost:
+            affordable = int((money - dynamic_reserve) // cost)
             buy_qty = min(shortfall, affordable)
             if buy_qty > 0:
                 orders.append(["BUY_ANIMAL", animal, buy_qty])
@@ -678,7 +710,7 @@ def _build_market_orders(obs, me, private, market, step, animal_targets, town_de
         market_inv = inventory.get("FERTILIZER", MARKET_PARAMS["FERTILIZER"]["I0"])
         buy_qty = min(
             fertilizer_shortfall,
-            _max_buy_qty("FERTILIZER", market_inv, money, CASH_RESERVE, max_rise_frac=MAX_PRICE_RISE_FRAC)
+            _max_buy_qty("FERTILIZER", market_inv, money, dynamic_reserve, max_rise_frac=MAX_PRICE_RISE_FRAC)
         )
         if buy_qty > 0:
             orders.append(["BUY_PRODUCT", "FERTILIZER", buy_qty])
@@ -707,8 +739,8 @@ def _build_market_orders(obs, me, private, market, step, animal_targets, town_de
             break
         cost = CROP_CONFIG[crop]["seed_cost"]
         have = seeds.get(crop, 0)
-        if have < 5 and money >= cost + CASH_RESERVE:
-            buy_n = min(5, int((money - CASH_RESERVE) // cost))
+        if have < 5 and money >= cost + dynamic_reserve:
+            buy_n = min(5, int((money - dynamic_reserve) // cost))
             if buy_n > 0:
                 orders.append(["BUY_SEED", crop, buy_n])
                 money -= buy_n * cost
@@ -717,7 +749,7 @@ def _build_market_orders(obs, me, private, market, step, animal_targets, town_de
     if len(orders) < 10 and shed.get("WHEAT", 0) < WHEAT_FEED_BUFFER:
         need = WHEAT_FEED_BUFFER - shed.get("WHEAT", 0)
         market_inv = inventory.get("WHEAT", MARKET_PARAMS["WHEAT"]["I0"])
-        buy_n = min(need, _max_buy_qty("WHEAT", market_inv, money, CASH_RESERVE, max_rise_frac=MAX_PRICE_RISE_FRAC))
+        buy_n = min(need, _max_buy_qty("WHEAT", market_inv, money, dynamic_reserve, max_rise_frac=MAX_PRICE_RISE_FRAC))
         if buy_n > 0:
             orders.append(["BUY_PRODUCT", "WHEAT", buy_n])
 
