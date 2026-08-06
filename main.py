@@ -57,16 +57,16 @@ CROP_ROTATION = [
 ]
 
 PRIORITY_URGENT_HARVEST = 95
-PRIORITY_WEED = 60
-PRIORITY_HARVEST_ONGOING = 70
-PRIORITY_ANIMAL_HARVEST = 65
+PRIORITY_ANIMAL_HARVEST = 85
 PRIORITY_FEED = 80
+PRIORITY_PLACE_ANIMAL = 75
+PRIORITY_HARVEST_ONGOING = 70
+PRIORITY_BUILD_STRUCTURE = 65
+PRIORITY_WEED = 60
 PRIORITY_WATER_BASE = 50
 PRIORITY_FERTILIZE_ONGOING = 45
 PRIORITY_FERTILIZE_ONETIME = 35
 PRIORITY_CARE = 30
-PRIORITY_BUILD_STRUCTURE = 30
-PRIORITY_PLACE_ANIMAL = 55
 PRIORITY_PLANT = 20
 PRIORITY_COLLECT_FERTILIZER = 15
 
@@ -87,10 +87,10 @@ ANIMAL_CONFIG = {
     "SHEEP": {"structure": "PASTURE", "product": "WOOL", "cost": 500, "base_price": 200,
                "first_yield_day": 6, "interval_days": 3, "max_held": 6},
 }
+ANIMAL_TARGETS = {"GOOSE": 2, "COW": 2, "SHEEP": 2}
+STRUCTURE_TARGETS = {"COOP": 2, "PASTURE": 4}
 
-STRUCTURE_TARGETS = {"COOP": 1, "PASTURE": 2}
-
-WHEAT_FEED_BUFFER = 10
+WHEAT_FEED_BUFFER = 15
 FERTILIZER_FETCH_QTY = 1
 
 # ---------------------------------------------------------------------------
@@ -149,10 +149,26 @@ def _price_at(item, inv):
     return max(1, round(price))
 
 
-def _max_sell_qty(item, market_inv, available, max_drop_frac=0.15, hard_cap=25):
+def _max_sell_qty(item, market_inv, available, max_drop_frac=0.15, hard_cap=25, step=0, total_steps=720):
     if item not in MARKET_PARAMS or available <= 0:
         return 0
+    
+    steps_left = total_steps - step
+    # End-game liquidation: in last 3 days (72 steps), dump everything available
+    if steps_left <= 72:
+        return min(available, hard_cap)
+
     current_price = _price_at(item, market_inv)
+    base_price = MARKET_PARAMS[item]["base"]
+
+    # Market Arbitrage: hold inventory when price is heavily depressed (< 75% base) unless shed is overflowing
+    if current_price < base_price * 0.75 and available < 12:
+        return 0
+
+    # Surge selling: expand drop tolerance when market price is high
+    if current_price >= base_price * 1.1:
+        max_drop_frac = 0.25
+
     floor_price = max(1, current_price * (1 - max_drop_frac))
     qty = 0
     sim_inv = market_inv
@@ -594,8 +610,8 @@ def _build_market_orders(obs, me, private, market, step, animal_targets):
     # --- Price-aware drip-sell of shed contents ---
     # Ensure we don't accidentally sell our live animals using ANIMAL_CONFIG
     sellable = [(item, count) for item, count in shed.items()
-                if count > 0 and item not in ANIMAL_CONFIG]
-    sellable.sort(key=lambda kv: -prices.get(kv[0], 1))
+                if count > 0 and item not in ANIMAL_TARGETS]
+    sellable.sort(key=lambda kv: -prices.get(kv[0], MARKET_PARAMS.get(kv[0], {}).get("base", 1)))
 
     for item, count in sellable:
         if len(orders) >= 10:
@@ -605,7 +621,7 @@ def _build_market_orders(obs, me, private, market, step, animal_targets):
             available = max(0, count - WHEAT_FEED_BUFFER)
 
         market_inv = inventory.get(item, MARKET_PARAMS.get(item, {}).get("I0", 10000))
-        qty = _max_sell_qty(item, market_inv, available, max_drop_frac=MAX_PRICE_DROP_FRAC)
+        qty = _max_sell_qty(item, market_inv, available, max_drop_frac=MAX_PRICE_DROP_FRAC, step=step)
         if qty <= 0:
             continue
         orders.append(["SELL", item, qty])
