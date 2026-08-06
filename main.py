@@ -121,17 +121,29 @@ MARKET_PARAMS = {
 # Town Demand Mapping
 # ---------------------------------------------------------------------------
 TOWN_SHOPS = {
-    "BAKERY": ["EGG", "WHEAT"],
-    "YARN_STORE": ["WOOL", "WOOL"],
-    "DAIRY": ["MILK", "MILK"],
-    "GREENGROCER": ["CARROT", "TOMATO"],
-    "FRUIT_STAND": ["MELON", "STRAWBERRY"]
+    "Bakery": ["EGG", "WHEAT"],
+    "Pizza Shop": ["MILK", "TOMATO", "WHEAT"],
+    "Brunch Spot": ["EGG", "WHEAT", "STRAWBERRY"],
+    "Yarn Store": ["WOOL", "WOOL"],
+    "Ice Cream Shop": ["STRAWBERRY", "MILK", "WHEAT"],
+    "Pet Cafe": ["CARROT", "CARROT"],
+    "Smoothie Shop": ["STRAWBERRY", "MILK"],
+    "Farmers Market": ["WHEAT", "CARROT", "TOMATO", "STRAWBERRY"]
 }
 
 def _get_town_demand(obs):
     """Calculates active town demand for each product."""
-    # Base demand: Town Center consumes 1 of everything every 12 turns
-    demand = {item: 1 for item in MARKET_PARAMS}
+    day = obs.get("day", 0)
+    
+    # Base demand: Town Center consumes items scaling with the day
+    center_drain = 1
+    if day >= 20:
+        center_drain = 4
+    elif day >= 10:
+        center_drain = 2
+        
+    demand = {item: center_drain for item in MARKET_PARAMS if item != "FERTILIZER"}
+    demand["FERTILIZER"] = 0 # Town center ignores fertilizer
     
     for shop in obs.get("town", {}).get("unlocked_shops", []):
         for item in TOWN_SHOPS.get(shop, []):
@@ -343,7 +355,6 @@ def _build_tasks(obs, me, plot_cap, market, private, animal_targets, town_demand
             if yield_units > 0 and decaying_soon:
                 tasks.append({"pos": pos, "action": ["HARVEST"], "priority": PRIORITY_URGENT_HARVEST})
             elif yield_units == cfg["max_yield"]:
-                # Harvest instantly when max yield is reached, don't wait for decay
                 tasks.append({"pos": pos, "action": ["HARVEST"], "priority": PRIORITY_HARVEST_ONGOING + 5})
             elif yield_units > 0 and cfg["ongoing"]:
                 tasks.append({"pos": pos, "action": ["HARVEST"], "priority": PRIORITY_HARVEST_ONGOING})
@@ -369,12 +380,10 @@ def _build_tasks(obs, me, plot_cap, market, private, animal_targets, town_demand
                 candidates = []
                 for a, a_cfg in ANIMAL_CONFIG.items():
                     if a_cfg["structure"] == kind:
-                        # Place if we are below target, OR if we already own one in the shed
                         if animal_counts.get(a, 0) < animal_targets.get(a, 0) or shed.get(a, 0) > 0:
                             candidates.append(a)
                 
                 if candidates:
-                    # Sort so animals we already own take priority over planned targets
                     candidates.sort(key=lambda a: (-shed.get(a, 0), -animal_targets.get(a, 0)))
                     target_animal = candidates[0]
                     tasks.append({"pos": pos, "action": ["PLACE", target_animal],
@@ -583,37 +592,28 @@ def _build_market_orders(obs, me, private, market, step, animal_targets, town_de
         money -= FARM_HAND_COST_MULT * _fib(hires_today)
         hires_today += 1
 
-    # --- Buy animals, gated on an actual free structure slot ---------------
-    # (See module docstring: buying ahead of a structure existing is the bug
-    # that was stranding capital idle for 12-24 days.)
-    # --- Buy animals, gated on an actual free structure slot ---
+    # --- Buy animals (Pre-buying allowed) ---
     placed = _animal_shortfall(me)
-    structures = _structure_counts(me)
-    structure_occupied = {"COOP": 0, "PASTURE": 0}
-    for a, cfg in ANIMAL_CONFIG.items():
-        structure_occupied[cfg["structure"]] += placed.get(a, 0)
-    structure_reserved = {"COOP": 0, "PASTURE": 0}
-    for a, cfg in ANIMAL_CONFIG.items():
-        structure_reserved[cfg["structure"]] += shed.get(a, 0)
-
+    
     for animal, target in animal_targets.items():
         if len(orders) >= 10:
             break
+            
         cfg = ANIMAL_CONFIG[animal]
-        structure = cfg["structure"]
-        free_slots = (structures[structure]
-                      - structure_occupied[structure]
-                      - structure_reserved[structure])
-        already_owned = placed.get(animal, 0) + shed.get(animal, 0)
         cost = cfg["cost"]
-        if (already_owned < target and free_slots > 0
-                and money - CASH_RESERVE >= cost):
-            orders.append(["BUY_ANIMAL", animal, 1])
-            money -= cost
-            structure_reserved[structure] += 1  # claim the slot this turn
+        already_owned = placed.get(animal, 0) + shed.get(animal, 0)
+        carried = sum(_carried_count(private, i, animal) for i in range(len(private.get("inventories", []))))
+        total_owned = already_owned + carried
+        shortfall = target - total_owned
+        
+        if shortfall > 0 and money - CASH_RESERVE >= cost:
+            affordable = int((money - CASH_RESERVE) // cost)
+            buy_qty = min(shortfall, affordable)
+            if buy_qty > 0:
+                orders.append(["BUY_ANIMAL", animal, buy_qty])
+                money -= cost * buy_qty
 
     # --- Price-aware drip-sell of shed contents ---
-    # Ensure we don't accidentally sell our live animals
     sellable = [(item, count) for item, count in shed.items()
                 if count > 0 and item not in ANIMAL_CONFIG]
     
@@ -629,9 +629,7 @@ def _build_market_orders(obs, me, private, market, step, animal_targets, town_de
 
         market_inv = inventory.get(item, MARKET_PARAMS.get(item, {}).get("I0", 10000))
         
-        # TOWN DEMAND AWARE SELLING:
-        # If the town heavily demands this item, they will drain the market inventory for us.
-        # Therefore, we restrict how much we are willing to crash the price ourselves.
+        # TOWN DEMAND AWARE SELLING: restrict crashing the price if town will eat inventory
         dynamic_drop_frac = MAX_PRICE_DROP_FRAC / max(1, town_demand.get(item, 1))
         
         qty = _max_sell_qty(item, market_inv, available, max_drop_frac=dynamic_drop_frac)
@@ -639,7 +637,7 @@ def _build_market_orders(obs, me, private, market, step, animal_targets, town_de
             continue
         orders.append(["SELL", item, qty])
 
-    # --- Buy Fertilizer for High-ROI Crops (e.g., Melon) ---
+    # --- Buy Fertilizer for High-ROI Crops ---
     fertilizer_demand = 0
     for row in me["tiles"]:
         for t in row:
@@ -652,7 +650,6 @@ def _build_market_orders(obs, me, private, market, step, animal_targets, town_de
                     if fertilized_until < obs["day"] and cfg["bonus_window"][0] <= age <= cfg["bonus_window"][1]:
                         fertilizer_demand += 1
 
-    # FIX: Account for fertilizer currently being carried by units so we don't infinitely re-buy
     carried_fert = sum(_carried_count(private, i, "FERTILIZER") for i in range(len(private.get("inventories", []))))
     fertilizer_shortfall = fertilizer_demand - (shed.get("FERTILIZER", 0) + carried_fert)
     
@@ -666,17 +663,18 @@ def _build_market_orders(obs, me, private, market, step, animal_targets, town_de
             orders.append(["BUY_PRODUCT", "FERTILIZER", buy_qty])
             money -= buy_qty * _price_at("FERTILIZER", market_inv)
 
-    # --- Keep seed stock topped up (Optimized) ---
-    # Determine the single best crop to plant right now so we don't buy useless seeds
+    # --- Keep seed stock topped up (Town Aware) ---
     best_crop_to_buy = "WHEAT"
     best_roi = -float('inf')
     for c, c_cfg in CROP_CONFIG.items():
-        roi = (prices.get(c, c_cfg["base_price"]) * c_cfg["max_yield"]) - c_cfg["seed_cost"]
-        if roi > best_roi:
-            best_roi = roi
+        current_price = prices.get(c, c_cfg["base_price"])
+        boosted_price = current_price * (1 + (town_demand.get(c, 1) * 0.05))
+        expected_profit = (boosted_price * c_cfg["max_yield"]) - c_cfg["seed_cost"]
+        
+        if expected_profit > best_roi:
+            best_roi = expected_profit
             best_crop_to_buy = c
 
-    # Only buy seeds we actually intend to plant, plus Wheat (always needed for animal feed)
     target_seeds = {"WHEAT", best_crop_to_buy}
     
     for crop in target_seeds:
@@ -690,13 +688,11 @@ def _build_market_orders(obs, me, private, market, step, animal_targets, town_de
                 orders.append(["BUY_SEED", crop, buy_n])
                 money -= buy_n * cost
 
-
-    # --- Keep wheat feed buffer topped up via BUY_PRODUCT --------------------
+    # --- Keep wheat feed buffer topped up ---
     if len(orders) < 10 and shed.get("WHEAT", 0) < WHEAT_FEED_BUFFER:
         need = WHEAT_FEED_BUFFER - shed.get("WHEAT", 0)
         market_inv = inventory.get("WHEAT", MARKET_PARAMS["WHEAT"]["I0"])
-        buy_n = min(need, _max_buy_qty("WHEAT", market_inv, money, CASH_RESERVE,
-                                         max_rise_frac=MAX_PRICE_RISE_FRAC))
+        buy_n = min(need, _max_buy_qty("WHEAT", market_inv, money, CASH_RESERVE, max_rise_frac=MAX_PRICE_RISE_FRAC))
         if buy_n > 0:
             orders.append(["BUY_PRODUCT", "WHEAT", buy_n])
 
@@ -749,7 +745,7 @@ def agent(obs):
     # 2. Dynamically rank and assign animal targets 
     animal_targets = _get_dynamic_animal_targets(market, town_demand)
 
-    # 3. Pass the targets and demand down the pipeline
+    # 3. Pass everything down the pipeline
     tasks = _build_tasks(obs, me, plot_cap, market, private, animal_targets, town_demand)
     assignment = _assign_tasks(units, tasks, private, private.get("shed", {}))
     unit_actions = _build_unit_actions(units, assignment)
