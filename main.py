@@ -264,7 +264,7 @@ def _build_tasks(obs, me, plot_cap, market, private, animal_targets):
             if active_plots >= plot_cap:
                 continue
                 
-            # --- Dynamic Crop-Mix Rebalancing ---
+            # --- Dynamic Crop-Mix Rebalancing (With Bottom Line) ---
             prices = market.get("prices", {})
             best_crop = "WHEAT"
             best_score = -float('inf')
@@ -276,9 +276,13 @@ def _build_tasks(obs, me, plot_cap, market, private, animal_targets):
                 current_price = prices.get(c, cfg["base_price"])
                 expected_profit = (current_price * cfg["max_yield"]) - cfg["seed_cost"]
                 
-                # Penalty: Subtract a percentage of the price for every active plot of this crop
-                # This naturally forces diversification as a crop saturates our farm
-                penalty = crop_counts[c] * (current_price * 0.5)
+                # Softened penalty with a bottom line
+                # 10% penalty per active plot, but capped at 50% of expected profit
+                # This ensures a massively profitable crop like Melon never gets 
+                # penalized completely out of consideration.
+                raw_penalty = crop_counts[c] * (current_price * 0.10)
+                penalty = min(raw_penalty, expected_profit * 0.50)
+                
                 score = expected_profit - penalty
 
                 if score > best_score:
@@ -602,6 +606,38 @@ def _build_market_orders(obs, me, private, market, step, animal_targets):
         if qty <= 0:
             continue
         orders.append(["SELL", item, qty])
+
+    # --- Buy Fertilizer for High-ROI Crops (e.g., Melon) ---
+    fertilizer_demand = 0
+    for row in me["tiles"]:
+        for t in row:
+            if isinstance(t, dict) and t.get("kind") == "PLANT":
+                crop = t.get("crop")
+                # Only buy market fertilizer if the yield bonus massively outweighs the $100 cost
+                if crop == "MELON":
+                    cfg = CROP_CONFIG[crop]
+                    age = obs["day"] - t.get("planted_day", obs["day"])
+                    fertilized_until = t.get("fertilized_until_day", -1)
+                    
+                    # Tally demand if it is in the window and currently unfertilized
+                    if fertilized_until < obs["day"] and cfg["bonus_window"][0] <= age <= cfg["bonus_window"][1]:
+                        fertilizer_demand += 1
+
+    fertilizer_shortfall = fertilizer_demand - shed.get("FERTILIZER", 0)
+    
+    if fertilizer_shortfall > 0 and len(orders) < 10:
+        market_inv = inventory.get("FERTILIZER", MARKET_PARAMS["FERTILIZER"]["I0"])
+        
+        # Cap the purchase by our available budget and safety margins
+        buy_qty = min(
+            fertilizer_shortfall,
+            _max_buy_qty("FERTILIZER", market_inv, money, CASH_RESERVE, max_rise_frac=MAX_PRICE_RISE_FRAC)
+        )
+        
+        if buy_qty > 0:
+            orders.append(["BUY_PRODUCT", "FERTILIZER", buy_qty])
+            # Deduct the approximate cost so subsequent seed/wheat orders don't double-spend
+            money -= buy_qty * _price_at("FERTILIZER", market_inv)
 
     # --- Keep seed stock topped up -------------------------------------------
     for crop in CROP_CONFIG:
