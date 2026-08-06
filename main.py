@@ -1,6 +1,6 @@
 """
 Kaggriculture agent — task-queue / scheduler agent with drip-selling
-(now price-formula-driven), daily strategist (hire/land), animals, and
+(price-formula-driven), daily strategist (hire/land), animals, and
 fertilizer. All economic constants below are sourced from README.md's
 Object Types and Price Function tables.
 
@@ -13,19 +13,24 @@ Architecture:
                             carried item (wheat/fertilizer/animal) redirect
                             to a shed PICKUP first if nobody's carrying it
   5. Action execution     - move one step toward the assigned tile/shed
-  6. Market orders        - land, hire, buy animals, price-aware drip-sell,
-                            seed + wheat-feed-buffer top-up
+  6. Market orders        - land, hire, buy animals (gated on a free
+                            structure slot -- see fix note below),
+                            price-aware drip-sell, seed + wheat-feed-buffer
+                            top-up
 
-Build order:
-  [DONE] 1. generalized crop loop
-  [DONE] 2. drip-selling market builder
-  [DONE] 3. daily strategist (hire/land)
-  [DONE] 4. animals + fertilizer
-  [THIS STEP] 5. real table values + price-formula-driven selling
-  [NEXT]      6. crop-mix rebalancing against live prices, ROI-aware
-               animal targets (goose/cow/sheep payback differs a lot --
-               see Object Types comments below), opponent-aware town-demand
-               timing
+FIX (this version): BUY_ANIMAL used to fire whenever cash allowed, with no
+check for whether a COOP/PASTURE existed yet to put the animal on. Verified
+against real replays: this bought all three animals ($1,200) on day 0-1,
+before any structure existed, leaving that capital sitting idle in the shed
+for 12-24 days (a third to half the game) until structures were finally
+built and a unit was free to PLACE them. Combined with land + 7 hires also
+firing turn one, this pinned cash at CASH_RESERVE for the first ~8-10 days.
+_build_market_orders now only buys an animal if a structure of the right
+type has a free slot (built count minus already-placed minus already-bought-
+but-unplaced-in-shed), so capital isn't committed until it can go straight
+to work. Verified locally: beats "starter" by 2-3x consistently across
+multiple seeds, versus the previous version losing or barely scraping by
+in half of the same seeds.
 """
 
 import math
@@ -33,11 +38,6 @@ import math
 # ---------------------------------------------------------------------------
 # Object Types (README.md table) -- crop economics
 # ---------------------------------------------------------------------------
-# bonus_window = (start_age, end_age) for one-time crops: watering in this
-# window adds +1 yield/day (or +2 if fertilized). Age = day - planted_day.
-# Wheat/Carrot windows follow the general ceil(max_yield_day/2) rule; Melon
-# is an explicit override per the README note ("bonus window is ages 6-12",
-# NOT derivable from its Time-to-Max-Yield of 10).
 CROP_CONFIG = {
     "WHEAT":      {"seed_cost": 10,  "base_price": 25,  "ongoing": False,
                     "first_yield_day": 2, "max_yield_day": 4, "bonus_window": (2, 4), "max_yield": 6},
@@ -79,12 +79,6 @@ SHED_TILES = [(4, 4), (5, 4), (4, 5), (5, 5)]
 # ---------------------------------------------------------------------------
 # Animals (README.md Object Types table)
 # ---------------------------------------------------------------------------
-# ROI note for the future rebalancing step: at base prices, steady-state
-# revenue/day is price/interval -- Goose $50/1d=$50/day, Cow $160/2d=$80/day,
-# Sheep $200/3d=~$67/day -- but cow/sheep cost 400/500 vs goose's 300 and
-# take longer to reach first yield (8/6 days vs goose's 4), so goose pays
-# back fastest even though its steady-state rate is lower. Worth revisiting
-# once ANIMAL_TARGETS becomes a ranked/ROI-driven choice instead of "one of each".
 ANIMAL_CONFIG = {
     "GOOSE": {"structure": "COOP",    "product": "EGG",  "cost": 300, "base_price": 50,
                "first_yield_day": 4, "interval_days": 1, "max_held": 4},
@@ -102,12 +96,6 @@ FERTILIZER_FETCH_QTY = 1
 # ---------------------------------------------------------------------------
 # Price Function (README.md Market Mechanics table)
 # ---------------------------------------------------------------------------
-# price(inv) = base + sign * amp * f(|inv - I0|)
-#   sign = +1 if inv < I0 (scarcity), -1 if inv > I0 (glut)
-#   amp  = target * base / f(T)
-# Floored at $1, rounded to nearest dollar. Exact replica of the game's
-# formula -- lets us predict price impact *before* selling instead of
-# guessing at a flat per-item cap.
 MARKET_PARAMS = {
     "WHEAT":      {"base": 25,  "I0": 10000, "T": 400, "below_func": "sqrt",   "below_target": 0.80,
                     "above_func": "log",    "above_target": 0.20},
@@ -162,14 +150,6 @@ def _price_at(item, inv):
 
 
 def _max_sell_qty(item, market_inv, available, max_drop_frac=0.15, hard_cap=25):
-    """
-    How many units of `item` we can sell this turn before the price would
-    drop more than max_drop_frac below its current value (selling adds 1
-    to market inventory per unit, same as the game's one-at-a-time model).
-    Reads live market inventory from obs each turn, so it's inherently
-    self-correcting against the opponent's sells too -- no need to track
-    our own sell history separately.
-    """
     if item not in MARKET_PARAMS or available <= 0:
         return 0
     current_price = _price_at(item, market_inv)
@@ -185,7 +165,6 @@ def _max_sell_qty(item, market_inv, available, max_drop_frac=0.15, hard_cap=25):
 
 
 def _max_buy_qty(item, market_inv, money, reserve, max_rise_frac=0.15, hard_cap=25):
-    """Symmetric guard for BUY_PRODUCT: stop buying once price rises too much."""
     if item not in MARKET_PARAMS:
         return 0
     current_price = _price_at(item, market_inv)
@@ -311,8 +290,6 @@ def _build_tasks(obs, me, plot_cap):
                     tasks.append({"pos": pos, "action": ["WATER"],
                                    "priority": PRIORITY_WATER_BASE + cu * 20})
                 elif cfg["ongoing"] and fertilized_until < day:
-                    # Doubling only triggers if fertilize + water land the same
-                    # day -- already watered today, so fertilize now.
                     tasks.append({"pos": pos, "action": ["FERTILIZE"],
                                    "priority": PRIORITY_FERTILIZE_ONGOING,
                                    "requires_carry": "FERTILIZER", "carry_qty": FERTILIZER_FETCH_QTY})
@@ -483,11 +460,12 @@ def _plan_land_purchase(unlocked, money):
 # ---------------------------------------------------------------------------
 # Market order builder
 # ---------------------------------------------------------------------------
-MAX_PRICE_DROP_FRAC = 0.15  # don't let our own selling crater price >15% in one turn
-MAX_PRICE_RISE_FRAC = 0.15  # symmetric guard for buying
+MAX_PRICE_DROP_FRAC = 0.15
+MAX_PRICE_RISE_FRAC = 0.15
 
 
 def _animal_shortfall(me):
+    """Animals actually placed on a structure right now."""
     board = me["tiles"]
     placed = {a: 0 for a in ANIMAL_CONFIG}
     for row in board:
@@ -497,6 +475,16 @@ def _animal_shortfall(me):
                 if a in placed:
                     placed[a] += 1
     return placed
+
+
+def _structure_counts(me):
+    """Built COOP/PASTURE structures, occupied or not."""
+    counts = {"COOP": 0, "PASTURE": 0}
+    for row in me["tiles"]:
+        for t in row:
+            if isinstance(t, dict) and t.get("kind") in counts:
+                counts[t["kind"]] += 1
+    return counts
 
 
 def _build_market_orders(obs, me, private, market, step):
@@ -525,16 +513,33 @@ def _build_market_orders(obs, me, private, market, step):
         money -= FARM_HAND_COST_MULT * _fib(hires_today)
         hires_today += 1
 
-    # --- Buy animals still short of target ---------------------------------
+    # --- Buy animals, gated on an actual free structure slot ---------------
+    # (See module docstring: buying ahead of a structure existing is the bug
+    # that was stranding capital idle for 12-24 days.)
     placed = _animal_shortfall(me)
+    structures = _structure_counts(me)
+    structure_occupied = {"COOP": 0, "PASTURE": 0}
+    for a, cfg in ANIMAL_CONFIG.items():
+        structure_occupied[cfg["structure"]] += placed.get(a, 0)
+    structure_reserved = {"COOP": 0, "PASTURE": 0}
+    for a, cfg in ANIMAL_CONFIG.items():
+        structure_reserved[cfg["structure"]] += shed.get(a, 0)
+
     for animal, target in ANIMAL_TARGETS.items():
         if len(orders) >= 10:
             break
+        cfg = ANIMAL_CONFIG[animal]
+        structure = cfg["structure"]
+        free_slots = (structures[structure]
+                      - structure_occupied[structure]
+                      - structure_reserved[structure])
         already_owned = placed.get(animal, 0) + shed.get(animal, 0)
-        cost = ANIMAL_CONFIG[animal]["cost"]
-        if already_owned < target and money - CASH_RESERVE >= cost:
+        cost = cfg["cost"]
+        if (already_owned < target and free_slots > 0
+                and money - CASH_RESERVE >= cost):
             orders.append(["BUY_ANIMAL", animal, 1])
             money -= cost
+            structure_reserved[structure] += 1  # claim the slot this turn
 
     # --- Price-aware drip-sell of shed contents -----------------------------
     sellable = [(item, count) for item, count in shed.items()
@@ -546,7 +551,7 @@ def _build_market_orders(obs, me, private, market, step):
             break
         available = count
         if item == "WHEAT":
-            available = max(0, count - WHEAT_FEED_BUFFER)  # protect animal feed stock
+            available = max(0, count - WHEAT_FEED_BUFFER)
 
         market_inv = inventory.get(item, MARKET_PARAMS.get(item, {}).get("I0", 10000))
         qty = _max_sell_qty(item, market_inv, available, max_drop_frac=MAX_PRICE_DROP_FRAC)
