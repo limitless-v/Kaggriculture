@@ -114,31 +114,6 @@ def _get_town_demand(obs):
             demand[item] += 1
     return demand
 
-def _get_opponent_state(obs):
-    """Scans the opponent's farm to count their active crops and animals."""
-    player = obs["player"]
-    opponent_id = 1 - player
-    opp_farm = obs["farms"][opponent_id]
-    
-    opp_counts = {c: 0 for c in CROP_CONFIG}
-    for a in ANIMAL_CONFIG:
-        opp_counts[a] = 0
-        
-    for row in opp_farm["tiles"]:
-        for t in row:
-            if isinstance(t, dict):
-                kind = t.get("kind")
-                if kind == "PLANT":
-                    crop = t.get("crop")
-                    if crop in opp_counts:
-                        opp_counts[crop] += 1
-                elif kind in ("COOP", "PASTURE"):
-                    animal = t.get("animal")
-                    if animal in opp_counts:
-                        opp_counts[animal] += 1
-                        
-    return opp_counts
-
 def _shape(name, x):
     if name == "linear":
         return x
@@ -277,6 +252,7 @@ def _build_tasks(obs, me, plot_cap, market, private, animal_targets, town_demand
 
             if active_plots >= plot_cap:
                 continue
+
             prices = market.get("prices", {})
             best_crop = "WHEAT"
             best_score = -float('inf')
@@ -534,7 +510,7 @@ def _structure_counts(me):
     return counts
 
 
-def _build_market_orders(obs, me, private, market, step, animal_targets, town_demand, opp_state):
+def _build_market_orders(obs, me, private, market, step, animal_targets, town_demand):
     shed = private.get("shed", {})
     seeds = private.get("seeds", {})
     money = me["money"]
@@ -599,6 +575,7 @@ def _build_market_orders(obs, me, private, market, step, animal_targets, town_de
     # instead of sold.
     sellable = [(item, count) for item, count in shed.items()
                 if count > 0 and item not in ANIMAL_CONFIG]
+
     sellable.sort(key=lambda kv: -(prices.get(kv[0], 1) * town_demand.get(kv[0], 1)))
 
     for item, count in sellable:
@@ -780,7 +757,7 @@ def agent(obs):
     farmer_action = unit_actions.get("farmer", ["PASS"])
     hand_actions = [unit_actions[f"hand{i}"] for i in range(len(me.get("hands", [])))]
 
-    market_orders = _build_market_orders(obs, me, private, market, step, animal_targets, town_demand, opp_state)
+    market_orders = _build_market_orders(obs, me, private, market, step, animal_targets, town_demand)
 
     return {"farmer": farmer_action, "hands": hand_actions, "market": market_orders}
 
