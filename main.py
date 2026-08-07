@@ -3,41 +3,10 @@ Kaggriculture agent — task-queue / scheduler agent with drip-selling
 (price-formula-driven), daily strategist (hire/land), animals, and
 fertilizer. All economic constants below are sourced from README.md's
 Object Types and Price Function tables.
-
-Architecture:
-  1. State parsing       - read obs into plain locals
-  2. Daily strategist     - hiring (Fibonacci cost curve) + land expansion
-  3. Task queue build     - crops, weeds, animal structures/lifecycle,
-                            fertilizer timing (per-crop bonus windows)
-  4. Unit scheduling      - greedy nearest-unit-to-task; tasks needing a
-                            carried item (wheat/fertilizer/animal) redirect
-                            to a shed PICKUP first if nobody's carrying it
-  5. Action execution     - move one step toward the assigned tile/shed
-  6. Market orders        - land, hire, buy animals (gated on a free
-                            structure slot -- see fix note below),
-                            price-aware drip-sell, seed + wheat-feed-buffer
-                            top-up
-
-FIX (this version): BUY_ANIMAL used to fire whenever cash allowed, with no
-check for whether a COOP/PASTURE existed yet to put the animal on. Verified
-against real replays: this bought all three animals ($1,200) on day 0-1,
-before any structure existed, leaving that capital sitting idle in the shed
-for 12-24 days (a third to half the game) until structures were finally
-built and a unit was free to PLACE them. Combined with land + 7 hires also
-firing turn one, this pinned cash at CASH_RESERVE for the first ~8-10 days.
-_build_market_orders now only buys an animal if a structure of the right
-type has a free slot (built count minus already-placed minus already-bought-
-but-unplaced-in-shed), so capital isn't committed until it can go straight
-to work. Verified locally: beats "starter" by 2-3x consistently across
-multiple seeds, versus the previous version losing or barely scraping by
-in half of the same seeds.
 """
 
 import math
 
-# ---------------------------------------------------------------------------
-# Object Types (README.md table) -- crop economics
-# ---------------------------------------------------------------------------
 CROP_CONFIG = {
     "WHEAT":      {"seed_cost": 10,  "base_price": 25,  "ongoing": False,
                     "first_yield_day": 2, "max_yield_day": 4, "bonus_window": (2, 4), "max_yield": 6},
@@ -76,9 +45,6 @@ HARVEST_LEAD_TURNS = TURNS_PER_DAY
 
 SHED_TILES = [(4, 4), (5, 4), (4, 5), (5, 5)]
 
-# ---------------------------------------------------------------------------
-# Animals (README.md Object Types table)
-# ---------------------------------------------------------------------------
 ANIMAL_CONFIG = {
     "GOOSE": {"structure": "COOP",    "product": "EGG",  "cost": 300, "base_price": 50,
                "first_yield_day": 4, "interval_days": 1, "max_held": 4},
@@ -88,14 +54,20 @@ ANIMAL_CONFIG = {
                "first_yield_day": 6, "interval_days": 3, "max_held": 6},
 }
 
-STRUCTURE_TARGETS = {"COOP": 1, "PASTURE": 2}
+STRUCTURE_TARGETS_PER_QUADRANT = {"COOP": 1, "PASTURE": 2}
+
+
+def _get_structure_targets(unlocked_count):
+    """Scale structure targets with land owned -- 3 structures total (the
+    old fixed target) left animals capped indefinitely once all 4 quadrants
+    were bought, wasting most of the purchased land. One COOP + two PASTURE
+    per unlocked quadrant scales animal income with the farm instead."""
+    return {name: per_quad * unlocked_count
+            for name, per_quad in STRUCTURE_TARGETS_PER_QUADRANT.items()}
 
 WHEAT_FEED_BUFFER = 10
 FERTILIZER_FETCH_QTY = 1
 
-# ---------------------------------------------------------------------------
-# Price Function (README.md Market Mechanics table)
-# ---------------------------------------------------------------------------
 MARKET_PARAMS = {
     "WHEAT":      {"base": 25,  "I0": 10000, "T": 400, "below_func": "sqrt",   "below_target": 0.80,
                     "above_func": "log",    "above_target": 0.20},
@@ -117,9 +89,6 @@ MARKET_PARAMS = {
                     "above_func": "linear", "above_target": 0.40},
 }
 
-# ---------------------------------------------------------------------------
-# Town Demand Mapping
-# ---------------------------------------------------------------------------
 TOWN_SHOPS = {
     "Bakery": ["EGG", "WHEAT"],
     "Pizza Shop": ["MILK", "TOMATO", "WHEAT"],
@@ -132,23 +101,17 @@ TOWN_SHOPS = {
 }
 
 def _get_town_demand(obs):
-    """Calculates active town demand for each product."""
     day = obs.get("day", 0)
-    
-    # Base demand: Town Center consumes items scaling with the day
     center_drain = 1
     if day >= 20:
         center_drain = 4
     elif day >= 10:
         center_drain = 2
-        
     demand = {item: center_drain for item in MARKET_PARAMS if item != "FERTILIZER"}
-    demand["FERTILIZER"] = 0 # Town center ignores fertilizer
-    
+    demand["FERTILIZER"] = 0
     for shop in obs.get("town", {}).get("unlocked_shops", []):
         for item in TOWN_SHOPS.get(shop, []):
             demand[item] += 1
-            
     return demand
 
 def _get_opponent_state(obs):
@@ -191,7 +154,6 @@ def _shape(name, x):
 
 
 def _price_at(item, inv):
-    """Replicates the game's price(inv) formula exactly."""
     p = MARKET_PARAMS.get(item)
     if p is None:
         return 1
@@ -207,7 +169,7 @@ def _price_at(item, inv):
     return max(1, round(price))
 
 
-def _max_sell_qty(item, market_inv, available, max_drop_frac=0.15, hard_cap=25):
+def _max_sell_qty(item, market_inv, available, max_drop_frac=0.15, hard_cap=200):
     if item not in MARKET_PARAMS or available <= 0:
         return 0
     current_price = _price_at(item, market_inv)
@@ -222,7 +184,7 @@ def _max_sell_qty(item, market_inv, available, max_drop_frac=0.15, hard_cap=25):
     return qty
 
 
-def _max_buy_qty(item, market_inv, money, reserve, max_rise_frac=0.15, hard_cap=25):
+def _max_buy_qty(item, market_inv, money, reserve, max_rise_frac=0.15, hard_cap=200):
     if item not in MARKET_PARAMS:
         return 0
     current_price = _price_at(item, market_inv)
@@ -258,11 +220,7 @@ def _nearest_shed_tile(pos):
     return min(SHED_TILES, key=lambda t: _manhattan(pos, t))
 
 
-# ---------------------------------------------------------------------------
-# Task queue
-# ---------------------------------------------------------------------------
-
-def _build_tasks(obs, me, plot_cap, market, private, animal_targets, town_demand, opp_state):
+def _build_tasks(obs, me, plot_cap, market, private, animal_targets, town_demand, structure_targets):
     step = obs.get("step", obs["day"] * TURNS_PER_DAY + obs["hour"])
     day = obs["day"]
     tiles = me["tiles"]
@@ -273,8 +231,6 @@ def _build_tasks(obs, me, plot_cap, market, private, animal_targets, town_demand
     active_plots = 0
     structure_counts = {"COOP": 0, "PASTURE": 0}
     animal_counts = {a: 0 for a in ANIMAL_CONFIG}
-    
-    # Track current crops and available seeds for dynamic planting
     crop_counts = {c: 0 for c in CROP_CONFIG}
     available_seeds = {c: private.get("seeds", {}).get(c, 0) for c in CROP_CONFIG}
 
@@ -299,13 +255,13 @@ def _build_tasks(obs, me, plot_cap, market, private, animal_targets, town_demand
     for x, y in coords:
         if _quadrant_of(x, y, half) not in unlocked:
             continue
-            
+
         tile = tiles[y][x]
         pos = (x, y)
 
         if tile is None:
             needed_structure = None
-            for structure, target in STRUCTURE_TARGETS.items():
+            for structure, target in structure_targets.items():
                 if structure_counts[structure] < target:
                     needed_structure = structure
                     break
@@ -321,26 +277,21 @@ def _build_tasks(obs, me, plot_cap, market, private, animal_targets, town_demand
 
             if active_plots >= plot_cap:
                 continue
-                
-            # --- Dynamic Crop-Mix Rebalancing (Town & Opponent Aware) ---
             prices = market.get("prices", {})
             best_crop = "WHEAT"
             best_score = -float('inf')
 
             for c, cfg in CROP_CONFIG.items():
                 if available_seeds[c] <= 0:
-                    continue 
+                    continue
 
                 current_price = prices.get(c, cfg["base_price"])
-                
-                # TOWN META
                 boosted_price = current_price * (1 + (town_demand.get(c, 1) * 0.05))
                 expected_profit = (boosted_price * cfg["max_yield"]) - cfg["seed_cost"]
-                
-                # Softened penalty with a bottom line
+
                 raw_penalty = crop_counts[c] * (current_price * 0.02)
                 penalty = min(raw_penalty, expected_profit * 0.50)
-                
+
                 score = expected_profit - penalty
 
                 if score > best_score:
@@ -406,7 +357,7 @@ def _build_tasks(obs, me, plot_cap, market, private, animal_targets, town_demand
                     if a_cfg["structure"] == kind:
                         if animal_counts.get(a, 0) < animal_targets.get(a, 0) or shed.get(a, 0) > 0:
                             candidates.append(a)
-                
+
                 if candidates:
                     candidates.sort(key=lambda a: (-shed.get(a, 0), -animal_targets.get(a, 0)))
                     target_animal = candidates[0]
@@ -437,10 +388,6 @@ def _build_tasks(obs, me, plot_cap, market, private, animal_targets, town_demand
     tasks.sort(key=lambda t: -t["priority"])
     return tasks
 
-
-# ---------------------------------------------------------------------------
-# Unit scheduling -- carry-aware
-# ---------------------------------------------------------------------------
 
 def _carried_count(private, unit_index, item):
     inventories = private.get("inventories", [])
@@ -515,13 +462,9 @@ def _build_unit_actions(units, assignment):
     return actions
 
 
-# ---------------------------------------------------------------------------
-# Daily strategist -- hiring + land
-# ---------------------------------------------------------------------------
 FARM_HAND_COST_MULT = 1
-HIRE_COST_CEILING = 13
-MAX_HIRES_PER_DAY = 7
-#CASH_RESERVE = 200
+HIRE_COST_CEILING = 200
+MAX_HIRES_PER_DAY = 15
 
 LAND_ORDER = ["NE", "SW", "SE"]
 LAND_COST = {"NE": 1000, "SW": 2000, "SE": 4000}
@@ -539,11 +482,11 @@ def _plan_hires(money, hires_today, current_hands, unlocked_count, dynamic_reser
     target_total_units = (unlocked_count * 24) // PLOTS_PER_UNIT
     target_hands = max(0, target_total_units - 1)
     allowed_new_hires = max(0, target_hands - current_hands)
-    
+
     n = hires_today
     budget = money - dynamic_reserve
     planned = 0
-    
+
     while planned < MAX_HIRES_PER_DAY and planned < allowed_new_hires:
         cost = FARM_HAND_COST_MULT * _fib(n)
         if cost > HIRE_COST_CEILING or cost > budget:
@@ -551,7 +494,7 @@ def _plan_hires(money, hires_today, current_hands, unlocked_count, dynamic_reser
         budget -= cost
         n += 1
         planned += 1
-        
+
     return planned
 
 
@@ -566,15 +509,11 @@ def _plan_land_purchase(unlocked, money, dynamic_reserve):
     return None
 
 
-# ---------------------------------------------------------------------------
-# Market order builder
-# ---------------------------------------------------------------------------
 MAX_PRICE_DROP_FRAC = 0.15
 MAX_PRICE_RISE_FRAC = 0.15
 
 
 def _animal_shortfall(me):
-    """Animals actually placed on a structure right now."""
     board = me["tiles"]
     placed = {a: 0 for a in ANIMAL_CONFIG}
     for row in board:
@@ -587,7 +526,6 @@ def _animal_shortfall(me):
 
 
 def _structure_counts(me):
-    """Built COOP/PASTURE structures, occupied or not."""
     counts = {"COOP": 0, "PASTURE": 0}
     for row in me["tiles"]:
         for t in row:
@@ -605,11 +543,9 @@ def _build_market_orders(obs, me, private, market, step, animal_targets, town_de
     unlocked = set(me["unlocked_quadrants"])
     hires_today = me.get("hires_today", 0)
 
-# --- 1. CALCULATE DYNAMIC CASH RESERVE ---
     active_plots = 0
     total_animals = 0
-    
-    # Count plots and placed animals
+
     for row in me["tiles"]:
         for t in row:
             if isinstance(t, dict):
@@ -617,31 +553,37 @@ def _build_market_orders(obs, me, private, market, step, animal_targets, town_de
                     active_plots += 1
                 elif t.get("kind") in ("COOP", "PASTURE") and t.get("animal") is not None:
                     total_animals += 1
-                    
-    # Add unplaced animals currently in the shed
+
     for a in ANIMAL_CONFIG:
         total_animals += shed.get(a, 0)
-        
-    # The new living reserve formula
+
     dynamic_reserve = 200 + (total_animals * 50) + (active_plots * 20)
-    # -----------------------------------------
+    # Scale the feed buffer with actual animal count -- a fixed buffer of 10
+    # was fine for the old 3-animal cap, but silently under-stocks once
+    # structure targets (and animal count) scale with land. Kept modest
+    # (~1 day of consumption) rather than a multi-day reserve: a bigger
+    # buffer just freezes wheat out of `available` for SELL indefinitely,
+    # since wheat production roughly tracks animal count too.
+    wheat_feed_buffer = max(WHEAT_FEED_BUFFER, total_animals)
+
+    # Hands expire at the end of every day and must be rehired from scratch
+    # (the Fibonacci cost resets to 1,1,2,3... each morning too, so this is
+    # cheap). Gating this behind `dynamic_reserve` is a lockout: the more
+    # animals/plots you have, the higher the reserve climbs, which can block
+    # the very rehire that's needed to keep those animals/plots alive at
+    # all -- a self-inflicted death spiral. Rehiring is a small, essential
+    # operating cost, not discretionary capital, so it uses a small fixed
+    # floor instead of the (animal/plot-inflated) dynamic_reserve, and runs
+    # before any discretionary spending below.
+    ESSENTIAL_FLOOR = 20
 
     orders = []
 
-    # --- Land purchase --------------------------------------------------
-    quadrant = _plan_land_purchase(unlocked, money, dynamic_reserve)
-    if quadrant is not None:
-        orders.append(["BUY_LAND"])
-        money -= LAND_COST[quadrant]
-
-    # --- Hire hands -------------------------------------------------------
-    # Define the missing variables based on your current state
     current_hands = len(me.get("hands", []))
     unlocked_count = len(unlocked)
-    
-    # Pass all 5 required arguments to the function
-    n_hires = _plan_hires(money, hires_today, current_hands, unlocked_count, dynamic_reserve)
-    
+
+    n_hires = _plan_hires(money, hires_today, current_hands, unlocked_count, ESSENTIAL_FLOOR)
+
     for _ in range(n_hires):
         if len(orders) >= 10:
             break
@@ -649,28 +591,12 @@ def _build_market_orders(obs, me, private, market, step, animal_targets, town_de
         money -= FARM_HAND_COST_MULT * _fib(hires_today)
         hires_today += 1
 
-    # --- Buy animals (Pre-buying allowed) ---
-    placed = _animal_shortfall(me)
-    
-    for animal, target in animal_targets.items():
-        if len(orders) >= 10:
-            break
-            
-        cfg = ANIMAL_CONFIG[animal]
-        cost = cfg["cost"]
-        already_owned = placed.get(animal, 0) + shed.get(animal, 0)
-        carried = sum(_carried_count(private, i, animal) for i in range(len(private.get("inventories", []))))
-        total_owned = already_owned + carried
-        shortfall = target - total_owned
-        
-        if shortfall > 0 and money - dynamic_reserve >= cost:
-            affordable = int((money - dynamic_reserve) // cost)
-            buy_qty = min(shortfall, affordable)
-            if buy_qty > 0:
-                orders.append(["BUY_ANIMAL", animal, buy_qty])
-                money -= cost * buy_qty
-
-    # --- Price-aware drip-sell of shed contents ---
+    # --- Sell first: realize cash and clear shed space before any
+    # discretionary spending below. This used to run after land/animal
+    # purchases, which could crowd SELL out of the 10-orders-per-turn cap
+    # once the farm scaled up -- verified this was causing product (wheat
+    # especially) to hit the 100-item shed cap and get silently discarded
+    # instead of sold.
     sellable = [(item, count) for item, count in shed.items()
                 if count > 0 and item not in ANIMAL_CONFIG]
     sellable.sort(key=lambda kv: -(prices.get(kv[0], 1) * town_demand.get(kv[0], 1)))
@@ -680,32 +606,81 @@ def _build_market_orders(obs, me, private, market, step, animal_targets, town_de
             break
         available = count
         if item == "WHEAT":
-            available = max(0, count - WHEAT_FEED_BUFFER)
+            available = max(0, count - wheat_feed_buffer)
 
         market_inv = inventory.get(item, MARKET_PARAMS.get(item, {}).get("I0", 10000))
-        dynamic_drop_frac = MAX_PRICE_DROP_FRAC / max(1, town_demand.get(item, 1))
-        
-        qty = _max_sell_qty(item, market_inv, available, max_drop_frac=dynamic_drop_frac)
+
+        # NOTE: previously divided MAX_PRICE_DROP_FRAC by town_demand here
+        # to "hold back" selling when the town would soon consume inventory
+        # anyway. Verified this was actively harmful: town_demand of 4-7 (a
+        # couple of shops unlocked) shrinks the allowed drop far enough that
+        # _max_sell_qty returns 0 for cheap staples like wheat -- a total
+        # sell lockout, not a gentle throttle. Wheat piled up unsold and
+        # started hitting the 100-item shed cap (verified: harvested product
+        # was being silently discarded). Selling at the plain threshold is
+        # far healthier and the price-impact model already protects against
+        # crashing prices.
+        qty = _max_sell_qty(item, market_inv, available, max_drop_frac=MAX_PRICE_DROP_FRAC)
         if qty <= 0:
             continue
         orders.append(["SELL", item, qty])
 
-    # --- Buy Fertilizer for High-ROI Crops ---
+    # --- Land purchase (discretionary -- still gated by the full reserve) --
+    quadrant = _plan_land_purchase(unlocked, money, dynamic_reserve)
+    if quadrant is not None:
+        orders.append(["BUY_LAND"])
+        money -= LAND_COST[quadrant]
+
+    placed = _animal_shortfall(me)
+
+    for animal, target in animal_targets.items():
+        if len(orders) >= 10:
+            break
+
+        cfg = ANIMAL_CONFIG[animal]
+        cost = cfg["cost"]
+        already_owned = placed.get(animal, 0) + shed.get(animal, 0)
+        carried = sum(_carried_count(private, i, animal) for i in range(len(private.get("inventories", []))))
+        total_owned = already_owned + carried
+        shortfall = target - total_owned
+
+        if shortfall > 0 and money - dynamic_reserve >= cost:
+            affordable = int((money - dynamic_reserve) // cost)
+            buy_qty = min(shortfall, affordable)
+            if buy_qty > 0:
+                orders.append(["BUY_ANIMAL", animal, buy_qty])
+                money -= cost * buy_qty
+
+    # Demand must match _build_tasks' actual FERTILIZE eligibility exactly
+    # (both ongoing crops with a lapsed fertilize window, and one-time crops
+    # inside their bonus window) -- the old version only ever counted MELON,
+    # so wheat/carrot/tomato/strawberry FERTILIZE tasks were being generated
+    # by the task queue but almost never actually supplied, wasting those
+    # crops' fertilizer bonus entirely.
     fertilizer_demand = 0
+    day = obs["day"]
     for row in me["tiles"]:
         for t in row:
             if isinstance(t, dict) and t.get("kind") == "PLANT":
                 crop = t.get("crop")
-                if crop == "MELON":
-                    cfg = CROP_CONFIG[crop]
-                    age = obs["day"] - t.get("planted_day", obs["day"])
-                    fertilized_until = t.get("fertilized_until_day", -1)
-                    if fertilized_until < obs["day"] and cfg["bonus_window"][0] <= age <= cfg["bonus_window"][1]:
+                cfg = CROP_CONFIG.get(crop)
+                if cfg is None:
+                    continue
+                fertilized_until = t.get("fertilized_until_day", -1)
+                if fertilized_until >= day:
+                    continue
+                if cfg["ongoing"]:
+                    if t.get("watered_today", False) and t.get("yield_units", 0) == 0:
+                        fertilizer_demand += 1
+                else:
+                    age = day - t.get("planted_day", day)
+                    if (t.get("watered_today", False) and t.get("yield_units", 0) == 0
+                            and cfg["bonus_window"][0] <= age <= cfg["bonus_window"][1]):
                         fertilizer_demand += 1
 
     carried_fert = sum(_carried_count(private, i, "FERTILIZER") for i in range(len(private.get("inventories", []))))
     fertilizer_shortfall = fertilizer_demand - (shed.get("FERTILIZER", 0) + carried_fert)
-    
+
     if fertilizer_shortfall > 0 and len(orders) < 10:
         market_inv = inventory.get("FERTILIZER", MARKET_PARAMS["FERTILIZER"]["I0"])
         buy_qty = min(
@@ -716,74 +691,67 @@ def _build_market_orders(obs, me, private, market, step, animal_targets, town_de
             orders.append(["BUY_PRODUCT", "FERTILIZER", buy_qty])
             money -= buy_qty * _price_at("FERTILIZER", market_inv)
 
-    # --- Keep seed stock topped up (Opponent & Town Aware) ---
-    best_crop_to_buy = "WHEAT"
-    best_roi = -float('inf')
+    # Restock ALL five crop types (not just wheat + one "best ROI" pick --
+    # verified that left carrot/tomato/strawberry seed stock at zero for the
+    # entire game). Ordered by expected profit so limited cash/order-slots
+    # go to the most valuable crop first, but every crop eventually gets
+    # restocked instead of 3 of 5 being permanently starved. Buffer target
+    # scales with land -- a 5-seed buffer was fine for one quadrant, but
+    # left up to 11 workers with almost nothing to plant once the farm
+    # reached full size (verified: ~50 of 100 tiles sat empty all game).
+    crop_roi = []
     for c, c_cfg in CROP_CONFIG.items():
         current_price = prices.get(c, c_cfg["base_price"])
         boosted_price = current_price * (1 + (town_demand.get(c, 1) * 0.05))
         expected_profit = (boosted_price * c_cfg["max_yield"]) - c_cfg["seed_cost"]
-        
-        # Penalize seed purchasing if opponent is heavily invested
-        raw_penalty = opp_state.get(c, 0) * (current_price * 0.10)
-        penalty = min(raw_penalty, expected_profit * 0.50)
-        
-        roi = expected_profit - penalty
-        if roi > best_roi:
-            best_roi = roi
-            best_crop_to_buy = c
+        crop_roi.append((expected_profit, c))
+    crop_roi.sort(reverse=True)
 
-    target_seeds = {"WHEAT", best_crop_to_buy}
-    for crop in target_seeds:
+    seed_target = 5
+
+    for _, crop in crop_roi:
         if len(orders) >= 10:
             break
         cost = CROP_CONFIG[crop]["seed_cost"]
         have = seeds.get(crop, 0)
-        if have < 5 and money >= cost + dynamic_reserve:
-            buy_n = min(5, int((money - dynamic_reserve) // cost))
+        if have < seed_target and money >= cost + dynamic_reserve:
+            buy_n = min(seed_target - have, int((money - dynamic_reserve) // cost))
             if buy_n > 0:
                 orders.append(["BUY_SEED", crop, buy_n])
                 money -= buy_n * cost
 
-    # --- Keep wheat feed buffer topped up ---
-    if len(orders) < 10 and shed.get("WHEAT", 0) < WHEAT_FEED_BUFFER:
-        need = WHEAT_FEED_BUFFER - shed.get("WHEAT", 0)
+    # Same lockout risk as hiring: don't let feed-stock top-up be blocked by
+    # a reserve that's inflated specifically because animals exist to feed.
+    if len(orders) < 10 and shed.get("WHEAT", 0) < wheat_feed_buffer:
+        need = wheat_feed_buffer - shed.get("WHEAT", 0)
         market_inv = inventory.get("WHEAT", MARKET_PARAMS["WHEAT"]["I0"])
-        buy_n = min(need, _max_buy_qty("WHEAT", market_inv, money, dynamic_reserve, max_rise_frac=MAX_PRICE_RISE_FRAC))
+        buy_n = min(need, _max_buy_qty("WHEAT", market_inv, money, ESSENTIAL_FLOOR, max_rise_frac=MAX_PRICE_RISE_FRAC))
         if buy_n > 0:
             orders.append(["BUY_PRODUCT", "WHEAT", buy_n])
 
     return orders[:10]
 
-def _get_dynamic_animal_targets(market, town_demand, opp_state):
+def _get_dynamic_animal_targets(market, town_demand, structure_targets):
     prices = market.get("prices", {})
     targets = {a: 0 for a in ANIMAL_CONFIG}
-    
-    for struct, max_structs in STRUCTURE_TARGETS.items():
+
+    for struct, max_structs in structure_targets.items():
         best_animal = None
         best_roi = -float('inf')
-        
+
         for a, cfg in ANIMAL_CONFIG.items():
             if cfg["structure"] == struct:
                 prod_price = prices.get(cfg["product"], cfg["base_price"])
-                
-                # TOWN DEMAND META: Boost projected price by 5% per unit of town demand
                 boosted_price = prod_price * (1 + (town_demand.get(cfg["product"], 1) * 0.05))
-                
-                # OPPONENT MODELING META: Discount projected price if opponent is hoarding this animal
-                opp_penalty = opp_state.get(a, 0) * 0.05
-                discounted_price = boosted_price * (1 - min(0.50, opp_penalty))
-                
-                # ROI: Daily revenue divided by upfront cost
-                roi = (discounted_price / cfg["interval_days"]) / cfg["cost"]
-                
+                roi = (boosted_price / cfg["interval_days"]) / cfg["cost"]
+
                 if roi > best_roi:
                     best_roi = roi
                     best_animal = a
-                    
+
         if best_animal:
             targets[best_animal] = max_structs
-            
+
     return targets
 
 
@@ -800,15 +768,12 @@ def agent(obs):
 
     plot_cap = PLOTS_PER_UNIT * len(units)
 
-    # 1. Parse Town Demand & Opponent State
+    unlocked_count = len(me["unlocked_quadrants"])
+    structure_targets = _get_structure_targets(unlocked_count)
     town_demand = _get_town_demand(obs)
-    opp_state = _get_opponent_state(obs)
+    animal_targets = _get_dynamic_animal_targets(market, town_demand, structure_targets)
 
-    # 2. Dynamically rank and assign animal targets 
-    animal_targets = _get_dynamic_animal_targets(market, town_demand, opp_state)
-
-    # 3. Pass everything down the pipeline
-    tasks = _build_tasks(obs, me, plot_cap, market, private, animal_targets, town_demand, opp_state)
+    tasks = _build_tasks(obs, me, plot_cap, market, private, animal_targets, town_demand, structure_targets)
     assignment = _assign_tasks(units, tasks, private, private.get("shed", {}))
     unit_actions = _build_unit_actions(units, assignment)
 
@@ -818,7 +783,6 @@ def agent(obs):
     market_orders = _build_market_orders(obs, me, private, market, step, animal_targets, town_demand, opp_state)
 
     return {"farmer": farmer_action, "hands": hand_actions, "market": market_orders}
-
 
 if __name__ == "__main__":
     import json
