@@ -68,6 +68,34 @@ def _get_structure_targets(unlocked_count):
 WHEAT_FEED_BUFFER = 10
 FERTILIZER_FETCH_QTY = 1
 
+SHED_CAPACITY = 100
+# Labour: maintain enough hands that watering schedules never slip.
+MIN_HANDS = 8
+# Seed stock buffer scales with free space so workers can fill the board.
+SEED_TARGET_MIN = 8
+SEED_TARGET_MAX = 80
+# Selling policy: hold while prices climb (town demand drains inventory),
+# liquidate only when the shed gets crowded or the season is nearly over.
+SELL_THRESHOLD = 60
+SELL_LATE_DAY = 27
+ITEM_SELL_HOLD_MAX = 40
+# Small absolute floor so essential rehiring/seeding/feeding is never locked
+# out by a reserve that grows with the farm.
+ESSENTIAL_FLOOR = 20
+# Hard cash buffer the farm always keeps on hand: guarantees tomorrow's
+# hands get hired and watering never slips while long crops mature.
+CASH_BUFFER = 200
+# Discretionary reserve (land, extra animals) — grows with the farm but does
+# not gate essential daily operations.
+RESERVE_BASE = 200
+RESERVE_PER_ANIMAL = 50
+RESERVE_PER_PLOT = 20
+# Extra cash kept back when buying land so the newly unlocked tiles can be
+# seeded instead of sitting empty.
+LAND_SEED_RESERVE = 600
+# Earliest day animals get bought (opening cash is spent seeding the farm).
+ANIMAL_START_DAY = 7
+
 MARKET_PARAMS = {
     "WHEAT":      {"base": 25,  "I0": 10000, "T": 400, "below_func": "sqrt",   "below_target": 0.80,
                     "above_func": "log",    "above_target": 0.20},
@@ -113,6 +141,39 @@ def _get_town_demand(obs):
         for item in TOWN_SHOPS.get(shop, []):
             demand[item] += 1
     return demand
+
+def _phase_weight(crop, day):
+    """Cash-bootstrap the first few days with cheap fast wheat/carrot, then
+    pivot to melons (best per-tile return; replanted until they can't mature).
+    Strawberries/tomatoes only pay off mid-game (price peaks late)."""
+    if day < 4:
+        return 1.0 if crop in ("WHEAT", "CARROT") else 0.0
+    if crop == "WHEAT":
+        return 1.0
+    if crop == "CARROT":
+        return 1.0 if day <= 10 else 0.0
+    if crop == "MELON":
+        return 1.0 if day <= 18 else 0.0
+    if crop in ("STRAWBERRY", "TOMATO"):
+        return 1.0 if day <= 14 else 0.0
+    return 0.0
+
+
+def _crop_score(crop, day, prices, town_demand, crop_counts=None):
+    cfg = CROP_CONFIG[crop]
+    current_price = prices.get(crop, cfg["base_price"])
+    boosted_price = current_price * (1 + (town_demand.get(crop, 1) * 0.05))
+    expected_profit = (boosted_price * cfg["max_yield"]) - cfg["seed_cost"]
+    score = expected_profit * _phase_weight(crop, day)
+    if crop_counts:
+        raw_penalty = crop_counts[crop] * (current_price * 0.02)
+        score -= min(raw_penalty, expected_profit * 0.50)
+    return score
+
+
+def _hire_cost_sum(n_hands):
+    return sum(FARM_HAND_COST_MULT * _fib(i) for i in range(n_hands))
+
 
 def _shape(name, x):
     if name == "linear":
@@ -257,19 +318,10 @@ def _build_tasks(obs, me, plot_cap, market, private, animal_targets, town_demand
             best_crop = "WHEAT"
             best_score = -float('inf')
 
-            for c, cfg in CROP_CONFIG.items():
+            for c in CROP_CONFIG:
                 if available_seeds[c] <= 0:
                     continue
-
-                current_price = prices.get(c, cfg["base_price"])
-                boosted_price = current_price * (1 + (town_demand.get(c, 1) * 0.05))
-                expected_profit = (boosted_price * cfg["max_yield"]) - cfg["seed_cost"]
-
-                raw_penalty = crop_counts[c] * (current_price * 0.02)
-                penalty = min(raw_penalty, expected_profit * 0.50)
-
-                score = expected_profit - penalty
-
+                score = _crop_score(c, day, prices, town_demand, crop_counts)
                 if score > best_score:
                     best_score = score
                     best_crop = c
@@ -361,6 +413,33 @@ def _build_tasks(obs, me, plot_cap, market, private, animal_targets, town_demand
                                "priority": PRIORITY_COLLECT_FERTILIZER})
             continue
 
+    # --- DROP tasks: move harvested produce out of a worker's inventory into
+    # the shed so it can be sold (and to avoid end-of-day overflow discard
+    # once the shed is nearly full). Bound to the specific unit that is
+    # actually carrying the goods.
+    shed_values = private.get("shed", {})
+    shed_used = sum(shed_values.values()) if shed_values else 0
+    for i, inv in enumerate(private.get("inventories", [])):
+        if not isinstance(inv, dict):
+            continue
+        carry = {item: n for item, n in inv.items() if n > 0 and item not in ANIMAL_CONFIG}
+        if not carry:
+            continue
+        room = SHED_CAPACITY - shed_used
+        if room <= 0:
+            continue
+        unit_name = "farmer" if i == 0 else (f"hand{i - 1}" if i - 1 < len(me["hands"]) else None)
+        if unit_name is None:
+            continue
+        # Urgent when the shed is nearly full (avoid discard), routine otherwise.
+        urgent = room <= sum(carry.values())
+        tasks.append({
+            "pos": _nearest_shed_tile(me["farmer"] if i == 0 else me["hands"][i - 1]),
+            "action": ["DROP"],
+            "priority": PRIORITY_HARVEST_ONGOING if urgent else PRIORITY_COLLECT_FERTILIZER,
+            "preferred_unit": unit_name,
+        })
+
     tasks.sort(key=lambda t: -t["priority"])
     return tasks
 
@@ -375,17 +454,29 @@ def _carried_count(private, unit_index, item):
 def _assign_tasks(units, tasks, private, shed):
     remaining = list(units)
     name_to_index = {name: i for i, (name, _pos) in enumerate(units)}
+    remaining_names = {name for name, _ in remaining}
     assignment = {}
 
     for task in tasks:
         if not remaining:
             break
 
+        # DROP-style tasks are bound to a specific carrying unit.
+        preferred = task.get("preferred_unit")
+        if preferred is not None:
+            if preferred not in remaining_names:
+                continue
+            assignment[preferred] = task
+            remaining.remove(next(u for u in remaining if u[0] == preferred))
+            remaining_names.discard(preferred)
+            continue
+
         req_item = task.get("requires_carry")
         if req_item is None:
             best = min(remaining, key=lambda u: _manhattan(u[1], task["pos"]))
             assignment[best[0]] = task
             remaining.remove(best)
+            remaining_names.discard(best[0])
             continue
 
         req_qty = task.get("carry_qty", 1)
@@ -396,6 +487,7 @@ def _assign_tasks(units, tasks, private, shed):
             best = min(carriers, key=lambda u: _manhattan(u[1], task["pos"]))
             assignment[best[0]] = task
             remaining.remove(best)
+            remaining_names.discard(best[0])
             continue
 
         if shed.get(req_item, 0) < req_qty:
@@ -409,6 +501,7 @@ def _assign_tasks(units, tasks, private, shed):
         }
         assignment[best[0]] = fetch_task
         remaining.remove(best)
+        remaining_names.discard(best[0])
 
     return assignment
 
@@ -444,7 +537,7 @@ MAX_HIRES_PER_DAY = 15
 
 LAND_ORDER = ["NE", "SW", "SE"]
 LAND_COST = {"NE": 1000, "SW": 2000, "SE": 4000}
-LAND_BUFFER = 500
+LAND_BUFFER = 100
 
 
 def _fib(n):
@@ -454,13 +547,11 @@ def _fib(n):
     return a
 
 
-def _plan_hires(money, hires_today, current_hands, unlocked_count, dynamic_reserve):
-    target_total_units = (unlocked_count * 24) // PLOTS_PER_UNIT
-    target_hands = max(0, target_total_units - 1)
+def _plan_hires(money, hires_today, current_hands, target_hands, essential_floor):
     allowed_new_hires = max(0, target_hands - current_hands)
 
     n = hires_today
-    budget = money - dynamic_reserve
+    budget = money - essential_floor
     planned = 0
 
     while planned < MAX_HIRES_PER_DAY and planned < allowed_new_hires:
@@ -474,12 +565,12 @@ def _plan_hires(money, hires_today, current_hands, unlocked_count, dynamic_reser
     return planned
 
 
-def _plan_land_purchase(unlocked, money, dynamic_reserve):
+def _plan_land_purchase(unlocked, money, reserve):
     for quadrant in LAND_ORDER:
         if quadrant in unlocked:
             continue
         cost = LAND_COST[quadrant]
-        if money - cost >= dynamic_reserve + LAND_BUFFER:
+        if money - cost >= reserve:
             return quadrant
         return None
     return None
@@ -517,10 +608,13 @@ def _build_market_orders(obs, me, private, market, step, animal_targets, town_de
     prices = market.get("prices", {})
     inventory = market.get("inventory", {})
     unlocked = set(me["unlocked_quadrants"])
+    unlocked_count = len(unlocked)
     hires_today = me.get("hires_today", 0)
+    day = obs["day"]
 
     active_plots = 0
     total_animals = 0
+    free_tiles = 0
 
     for row in me["tiles"]:
         for t in row:
@@ -529,84 +623,69 @@ def _build_market_orders(obs, me, private, market, step, animal_targets, town_de
                     active_plots += 1
                 elif t.get("kind") in ("COOP", "PASTURE") and t.get("animal") is not None:
                     total_animals += 1
+            elif t is None:
+                free_tiles += 1
 
     for a in ANIMAL_CONFIG:
         total_animals += shed.get(a, 0)
 
-    dynamic_reserve = 200 + (total_animals * 50) + (active_plots * 20)
-    # Scale the feed buffer with actual animal count -- a fixed buffer of 10
-    # was fine for the old 3-animal cap, but silently under-stocks once
-    # structure targets (and animal count) scale with land. Kept modest
-    # (~1 day of consumption) rather than a multi-day reserve: a bigger
-    # buffer just freezes wheat out of `available` for SELL indefinitely,
-    # since wheat production roughly tracks animal count too.
+    # Feed buffer scales with animal count (~1 day of consumption).
     wheat_feed_buffer = max(WHEAT_FEED_BUFFER, total_animals)
 
-    # Hands expire at the end of every day and must be rehired from scratch
-    # (the Fibonacci cost resets to 1,1,2,3... each morning too, so this is
-    # cheap). Gating this behind `dynamic_reserve` is a lockout: the more
-    # animals/plots you have, the higher the reserve climbs, which can block
-    # the very rehire that's needed to keep those animals/plots alive at
-    # all -- a self-inflicted death spiral. Rehiring is a small, essential
-    # operating cost, not discretionary capital, so it uses a small fixed
-    # floor instead of the (animal/plot-inflated) dynamic_reserve, and runs
-    # before any discretionary spending below.
-    ESSENTIAL_FLOOR = 20
+    # Discretionary reserve: grows with the farm, but never gates the
+    # essential rehiring/seeding/feeding below (those only need the small
+    # ESSENTIAL_FLOOR). Prevents the old death spiral where a big reserve
+    # blocked the very rehires that keep the farm alive.
+    dynamic_reserve = RESERVE_BASE + total_animals * RESERVE_PER_ANIMAL + active_plots * RESERVE_PER_PLOT
 
     orders = []
+    order_budget = money
 
+    # --- SELL: constantly convert shed stock to cash so cash-velocity keeps
+    # the farm growing. Prices keep rising (town demand drains inventory), so
+    # every batch is sold at a slightly higher price than the last. Only
+    # wheat is reserved for animal feed.
+    if True:
+        sellable = [(item, count) for item, count in shed.items()
+                    if count > 0 and item not in ANIMAL_CONFIG]
+        sellable.sort(key=lambda kv: -(prices.get(kv[0], 1) * town_demand.get(kv[0], 1)))
+        for item, count in sellable:
+            if len(orders) >= 10:
+                break
+            available = count
+            if item == "WHEAT":
+                available = max(0, count - wheat_feed_buffer)
+            if available <= 0:
+                continue
+            market_inv = inventory.get(item, MARKET_PARAMS.get(item, {}).get("I0", 10000))
+            qty = _max_sell_qty(item, market_inv, available, max_drop_frac=MAX_PRICE_DROP_FRAC)
+            if qty <= 0:
+                continue
+            orders.append(["SELL", item, qty])
+            order_budget += qty * prices.get(item, 1)
+
+    # --- HIRE hands: scale with unlocked land, always at least MIN_HANDS.
     current_hands = len(me.get("hands", []))
-    unlocked_count = len(unlocked)
-
-    n_hires = _plan_hires(money, hires_today, current_hands, unlocked_count, ESSENTIAL_FLOOR)
-
+    tile_count = unlocked_count * 25
+    target_hands = min(MAX_HIRES_PER_DAY,
+                       max(MIN_HANDS, tile_count // PLOTS_PER_UNIT))
+    n_hires = _plan_hires(order_budget, hires_today, current_hands, target_hands, ESSENTIAL_FLOOR)
     for _ in range(n_hires):
         if len(orders) >= 10:
             break
         orders.append(["HIRE"])
-        money -= FARM_HAND_COST_MULT * _fib(hires_today)
+        order_budget -= FARM_HAND_COST_MULT * _fib(hires_today)
         hires_today += 1
 
-    # --- Sell first: realize cash and clear shed space before any
-    # discretionary spending below. This used to run after land/animal
-    # purchases, which could crowd SELL out of the 10-orders-per-turn cap
-    # once the farm scaled up -- verified this was causing product (wheat
-    # especially) to hit the 100-item shed cap and get silently discarded
-    # instead of sold.
-    sellable = [(item, count) for item, count in shed.items()
-                if count > 0 and item not in ANIMAL_CONFIG]
-
-    sellable.sort(key=lambda kv: -(prices.get(kv[0], 1) * town_demand.get(kv[0], 1)))
-
-    for item, count in sellable:
-        if len(orders) >= 10:
-            break
-        available = count
-        if item == "WHEAT":
-            available = max(0, count - wheat_feed_buffer)
-
-        market_inv = inventory.get(item, MARKET_PARAMS.get(item, {}).get("I0", 10000))
-
-        # NOTE: previously divided MAX_PRICE_DROP_FRAC by town_demand here
-        # to "hold back" selling when the town would soon consume inventory
-        # anyway. Verified this was actively harmful: town_demand of 4-7 (a
-        # couple of shops unlocked) shrinks the allowed drop far enough that
-        # _max_sell_qty returns 0 for cheap staples like wheat -- a total
-        # sell lockout, not a gentle throttle. Wheat piled up unsold and
-        # started hitting the 100-item shed cap (verified: harvested product
-        # was being silently discarded). Selling at the plain threshold is
-        # far healthier and the price-impact model already protects against
-        # crashing prices.
-        qty = _max_sell_qty(item, market_inv, available, max_drop_frac=MAX_PRICE_DROP_FRAC)
-        if qty <= 0:
-            continue
-        orders.append(["SELL", item, qty])
-
-    # --- Land purchase (discretionary -- still gated by the full reserve) --
-    quadrant = _plan_land_purchase(unlocked, money, dynamic_reserve)
-    if quadrant is not None:
-        orders.append(["BUY_LAND"])
-        money -= LAND_COST[quadrant]
+    # --- Land purchase (discretionary). Land gated by reserve AND a minimum
+    # day so the opening turns aren't blown on land instead of seeds/animals.
+    quadrant = _plan_land_purchase(unlocked, order_budget,
+                                   CASH_BUFFER + LAND_BUFFER)
+    if quadrant is not None and len(orders) < 10:
+        min_day = {"NE": 2, "SW": 6, "SE": 12}.get(quadrant, 0)
+        if day >= min_day:
+            orders.append(["BUY_LAND"])
+            order_budget -= LAND_COST[quadrant]
 
     placed = _animal_shortfall(me)
 
@@ -621,12 +700,15 @@ def _build_market_orders(obs, me, private, market, step, animal_targets, town_de
         total_owned = already_owned + carried
         shortfall = target - total_owned
 
-        if shortfall > 0 and money - dynamic_reserve >= cost:
-            affordable = int((money - dynamic_reserve) // cost)
+        # Defer animal buying to mid-game: the opening cash must seed the
+        # farm, not sit in slow-to-payoff livestock. Gate by day AND a
+        # comfortable discretionary surplus.
+        if shortfall > 0 and day >= ANIMAL_START_DAY and order_budget - dynamic_reserve - LAND_BUFFER >= cost:
+            affordable = int((order_budget - dynamic_reserve) // cost)
             buy_qty = min(shortfall, affordable)
             if buy_qty > 0:
                 orders.append(["BUY_ANIMAL", animal, buy_qty])
-                money -= cost * buy_qty
+                order_budget -= cost * buy_qty
 
     # Demand must match _build_tasks' actual FERTILIZE eligibility exactly
     # (both ongoing crops with a lapsed fertilize window, and one-time crops
@@ -635,7 +717,6 @@ def _build_market_orders(obs, me, private, market, step, animal_targets, town_de
     # by the task queue but almost never actually supplied, wasting those
     # crops' fertilizer bonus entirely.
     fertilizer_demand = 0
-    day = obs["day"]
     for row in me["tiles"]:
         for t in row:
             if isinstance(t, dict) and t.get("kind") == "PLANT":
@@ -662,47 +743,40 @@ def _build_market_orders(obs, me, private, market, step, animal_targets, town_de
         market_inv = inventory.get("FERTILIZER", MARKET_PARAMS["FERTILIZER"]["I0"])
         buy_qty = min(
             fertilizer_shortfall,
-            _max_buy_qty("FERTILIZER", market_inv, money, dynamic_reserve, max_rise_frac=MAX_PRICE_RISE_FRAC)
+            _max_buy_qty("FERTILIZER", market_inv, order_budget, dynamic_reserve, max_rise_frac=MAX_PRICE_RISE_FRAC)
         )
         if buy_qty > 0:
             orders.append(["BUY_PRODUCT", "FERTILIZER", buy_qty])
-            money -= buy_qty * _price_at("FERTILIZER", market_inv)
+            order_budget -= buy_qty * _price_at("FERTILIZER", market_inv)
 
-    # Restock ALL five crop types (not just wheat + one "best ROI" pick --
-    # verified that left carrot/tomato/strawberry seed stock at zero for the
-    # entire game). Ordered by expected profit so limited cash/order-slots
-    # go to the most valuable crop first, but every crop eventually gets
-    # restocked instead of 3 of 5 being permanently starved. Buffer target
-    # scales with land -- a 5-seed buffer was fine for one quadrant, but
-    # left up to 11 workers with almost nothing to plant once the farm
-    # reached full size (verified: ~50 of 100 tiles sat empty all game).
-    crop_roi = []
-    for c, c_cfg in CROP_CONFIG.items():
-        current_price = prices.get(c, c_cfg["base_price"])
-        boosted_price = current_price * (1 + (town_demand.get(c, 1) * 0.05))
-        expected_profit = (boosted_price * c_cfg["max_yield"]) - c_cfg["seed_cost"]
-        crop_roi.append((expected_profit, c))
+    # Restock crop seeds; buffer scales with free space so workers can fill
+    # the board. Ordered by phase-aware profit so cash goes to the crop that
+    # pays back soonest. Seed spend is capped to always leave enough cash to
+    # rehire tomorrow's hands (hands expire each day and must be bought back).
+    crop_roi = [( _crop_score(c, day, prices, town_demand), c) for c in CROP_CONFIG]
     crop_roi.sort(reverse=True)
 
-    seed_target = 5
+    seed_target = min(SEED_TARGET_MAX, max(SEED_TARGET_MIN, free_tiles))
 
-    for _, crop in crop_roi:
+    for score, crop in crop_roi:
+        if score <= 0:
+            continue
         if len(orders) >= 10:
             break
         cost = CROP_CONFIG[crop]["seed_cost"]
         have = seeds.get(crop, 0)
-        if have < seed_target and money >= cost + dynamic_reserve:
-            buy_n = min(seed_target - have, int((money - dynamic_reserve) // cost))
+        if have < seed_target and order_budget >= cost + CASH_BUFFER:
+            buy_n = min(seed_target - have, int((order_budget - CASH_BUFFER) // cost))
             if buy_n > 0:
                 orders.append(["BUY_SEED", crop, buy_n])
-                money -= buy_n * cost
+                order_budget -= buy_n * cost
 
     # Same lockout risk as hiring: don't let feed-stock top-up be blocked by
     # a reserve that's inflated specifically because animals exist to feed.
     if len(orders) < 10 and shed.get("WHEAT", 0) < wheat_feed_buffer:
         need = wheat_feed_buffer - shed.get("WHEAT", 0)
         market_inv = inventory.get("WHEAT", MARKET_PARAMS["WHEAT"]["I0"])
-        buy_n = min(need, _max_buy_qty("WHEAT", market_inv, money, ESSENTIAL_FLOOR, max_rise_frac=MAX_PRICE_RISE_FRAC))
+        buy_n = min(need, _max_buy_qty("WHEAT", market_inv, order_budget, ESSENTIAL_FLOOR, max_rise_frac=MAX_PRICE_RISE_FRAC))
         if buy_n > 0:
             orders.append(["BUY_PRODUCT", "WHEAT", buy_n])
 
